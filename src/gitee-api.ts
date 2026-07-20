@@ -62,6 +62,49 @@ export class GiteeAPI {
 		return data.tree || [];
 	}
 
+	/**
+	 * Get the latest commit SHA of a branch.
+	 */
+	async getBranchSha(branch: string): Promise<string> {
+		const data = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${branch}`);
+		return data.object?.sha;
+	}
+
+	/**
+	 * Create a new branch from an existing branch or commit SHA.
+	 */
+	async createBranch(newBranch: string, fromRef: string = 'master'): Promise<void> {
+		console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
+		// Try the dedicated branches API first
+		try {
+			await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					branch_name: newBranch,
+					refs: fromRef,
+				}),
+			});
+			console.log(`[GiteeAPI] branch '${newBranch}' created via /branches API`);
+			return;
+		} catch (err: any) {
+			console.log(`[GiteeAPI] /branches API failed: ${err.message}, falling back to /git/refs`);
+		}
+
+		// Fallback: use git/refs API (GitHub-compatible)
+		const sha = await this.getBranchSha(fromRef);
+		if (!sha) throw new Error(`Cannot find SHA for branch '${fromRef}'`);
+		await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				ref: `refs/heads/${newBranch}`,
+				sha,
+			}),
+		});
+		console.log(`[GiteeAPI] branch '${newBranch}' created via /git/refs API from sha=${sha}`);
+	}
+
 	async getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]> {
 		return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.branch}`);
 	}

@@ -2,7 +2,7 @@ import { withErrno } from 'kerium';
 import { IndexFS, Index, Inode } from '@zenfs/core';
 import { S_IFDIR, S_IFREG } from '@zenfs/core/constants';
 import type { CreationOptions, InodeLike } from '@zenfs/core';
-import { GiteeAPI } from './gitee-api.js';
+import { GiteeAPI, type GiteeTreeItem } from './gitee-api.js';
 import type { GiteeOptions } from './types.js';
 
 /**
@@ -38,10 +38,26 @@ export class GiteeFS extends IndexFS {
 
 	/**
 	 * Initialize the file system by loading the repository tree.
+	 * If the configured branch does not exist, it will be created from 'master'.
 	 */
 	async init(): Promise<void> {
 		if (this.initialized) return;
-		const tree = await this.api.getTree(true);
+
+		let tree: GiteeTreeItem[] = [];
+		try {
+			tree = await this.api.getTree(true);
+		} catch (err: any) {
+			const msg = err.message || '';
+			// Branch not found — try to create it
+			if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
+				console.log(`[GiteeFS] Branch '${this.options.branch}' not found, attempting to create...`);
+				await this.api.createBranch(this.options.branch || 'master', 'master');
+				// Retry loading tree
+				tree = await this.api.getTree(true);
+			} else {
+				throw err;
+			}
+		}
 
 		for (const item of tree) {
 			const path = '/' + item.path;

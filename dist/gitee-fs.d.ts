@@ -25,6 +25,7 @@ export declare class GiteeFS extends IndexFS {
     private _queue;
     /**
      * Initialize the file system by loading the repository tree.
+     * If the configured branch does not exist, it will be created from 'master'.
      */
     init(): Promise<void>;
     /**

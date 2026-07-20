@@ -26,6 +26,14 @@ export declare class GiteeAPI {
     constructor(options: GiteeOptions);
     request(path: string, init?: RequestInit): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
+    /**
+     * Get the latest commit SHA of a branch.
+     */
+    getBranchSha(branch: string): Promise<string>;
+    /**
+     * Create a new branch from an existing branch or commit SHA.
+     */
+    createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
     getRaw(path: string): Promise<ArrayBuffer>;
     createFile(path: string, content: Uint8Array, message: string): Promise<void>;
