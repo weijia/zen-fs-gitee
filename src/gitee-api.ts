@@ -72,10 +72,18 @@ export class GiteeAPI {
 
 	/**
 	 * Create a new branch from an existing branch or commit SHA.
+	 *
+	 * Strategy:
+	 *  1. Try the dedicated POST /branches API (Gitee native).
+	 *  2. If the repo has NO branches at all (empty repo), the above
+	 *     will fail because there is no base ref. Fall back to creating
+	 *     an initial file via the Contents API, which implicitly creates
+	 *     the branch on the server side.
 	 */
 	async createBranch(newBranch: string, fromRef: string = 'master'): Promise<void> {
 		console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
-		// Try the dedicated branches API first
+
+		// Step 1: Try the dedicated branches API first
 		try {
 			await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
 				method: 'POST',
@@ -88,21 +96,24 @@ export class GiteeAPI {
 			console.log(`[GiteeAPI] branch '${newBranch}' created via /branches API`);
 			return;
 		} catch (err: any) {
-			console.log(`[GiteeAPI] /branches API failed: ${err.message}, falling back to /git/refs`);
+			console.log(`[GiteeAPI] /branches API failed: ${err.message}`);
 		}
 
-		// Fallback: use git/refs API (GitHub-compatible)
-		const sha = await this.getBranchSha(fromRef);
-		if (!sha) throw new Error(`Cannot find SHA for branch '${fromRef}'`);
-		await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
+		// Step 2: Empty repo — no branches exist at all.
+		// Gitee V5 has no POST /git/refs endpoint, so we use the Contents
+		// API to create an initial file which implicitly creates the branch.
+		console.log(`[GiteeAPI] falling back to Contents API to initialize branch '${newBranch}'`);
+		const content = btoa('');
+		await this.request(`/repos/${this.owner}/${this.repo}/contents/.gitkeep`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				ref: `refs/heads/${newBranch}`,
-				sha,
+				content,
+				message: `Initialize branch '${newBranch}'`,
+				branch: newBranch,
 			}),
 		});
-		console.log(`[GiteeAPI] branch '${newBranch}' created via /git/refs API from sha=${sha}`);
+		console.log(`[GiteeAPI] branch '${newBranch}' initialized via Contents API (.gitkeep)`);
 	}
 
 	async getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]> {

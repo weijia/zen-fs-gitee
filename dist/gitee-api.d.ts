@@ -32,6 +32,13 @@ export declare class GiteeAPI {
     getBranchSha(branch: string): Promise<string>;
     /**
      * Create a new branch from an existing branch or commit SHA.
+     *
+     * Strategy:
+     *  1. Try the dedicated POST /branches API (Gitee native).
+     *  2. If the repo has NO branches at all (empty repo), the above
+     *     will fail because there is no base ref. Fall back to creating
+     *     an initial file via the Contents API, which implicitly creates
+     *     the branch on the server side.
      */
     createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
