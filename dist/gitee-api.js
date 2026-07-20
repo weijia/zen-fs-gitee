@@ -15,9 +15,12 @@ export class GiteeAPI {
     async request(path, init) {
         const separator = path.includes('?') ? '&' : '?';
         const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
+        console.log(`[GiteeAPI] request: ${init?.method || 'GET'} ${url}`);
         const response = await fetch(url, init);
+        console.log(`[GiteeAPI] response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
         if (!response.ok) {
             const text = await response.text().catch(() => '');
+            console.log(`[GiteeAPI] ERROR body: ${text.substring(0, 500)}`);
             throw new Error(`Gitee API ${response.status}: ${text}`);
         }
         if (response.status === 204)
