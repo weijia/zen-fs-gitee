@@ -189,10 +189,12 @@ export class GiteeFS extends IndexFS {
         }
         const sha = this.shaCache.get(path);
         if (sha) {
-            await this.api.updateFile(path, merged, sha, `Update ${path}`);
+            const newSha = await this.api.updateFile(path, merged, sha, `Update ${path}`);
+            this.shaCache.set(path, newSha);
         }
         else {
-            await this.api.createFile(path, merged, `Create ${path}`);
+            const newSha = await this.api.createFile(path, merged, `Create ${path}`);
+            this.shaCache.set(path, newSha);
         }
     }
     writeSync(path, data, offset) {
@@ -209,7 +211,11 @@ export class GiteeFS extends IndexFS {
         const sha = this.shaCache.get(path);
         this._queue((sha
             ? this.api.updateFile(path, merged, sha, `Update ${path}`)
-            : this.api.createFile(path, merged, `Create ${path}`)).catch(() => { }));
+            : this.api.createFile(path, merged, `Create ${path}`))
+            .then((newSha) => {
+            this.shaCache.set(path, newSha);
+        })
+            .catch(() => { }));
     }
     // --- Sync ---
     async sync() {

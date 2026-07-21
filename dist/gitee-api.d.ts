@@ -32,19 +32,27 @@ export declare class GiteeAPI {
     getBranchSha(branch: string): Promise<string>;
     /**
      * Create a new branch from an existing branch or commit SHA.
-     *
-     * Strategy:
-     *  1. Try the dedicated POST /branches API (Gitee native).
-     *  2. If the repo has NO branches at all (empty repo), the above
-     *     will fail because there is no base ref. Fall back to creating
-     *     an initial file via the Contents API, which implicitly creates
-     *     the branch on the server side.
      */
     createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
     getRaw(path: string): Promise<ArrayBuffer>;
-    createFile(path: string, content: Uint8Array, message: string): Promise<void>;
-    updateFile(path: string, content: Uint8Array, sha: string, message: string): Promise<void>;
+    /**
+     * Create a new file. Returns the new blob SHA.
+     */
+    createFile(path: string, content: Uint8Array, message: string): Promise<string>;
+    /**
+     * Update an existing file. Returns the new blob SHA.
+     * On "SHA does not match" error, fetches the current SHA and retries once.
+     */
+    updateFile(path: string, content: Uint8Array, sha: string, message: string): Promise<string>;
+    /**
+     * Delete a file.
+     * On "SHA does not match" error, fetches the current SHA and retries once.
+     */
     deleteFile(path: string, sha: string, message: string): Promise<void>;
+    /**
+     * Get the current blob SHA of a file via the Contents API.
+     */
+    getFileSha(path: string): Promise<string | null>;
 }
 //# sourceMappingURL=gitee-api.d.ts.map
