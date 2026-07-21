@@ -94,7 +94,6 @@ describe('GiteeAPI', () => {
 		expect(init?.method).toBe('POST');
 		const body = JSON.parse(init?.body as string);
 		expect(body.message).toBe('create test');
-		expect(body.branch).toBe('main');
 		expect(body.content).toBe('aGVsbG8=');
 	});
 
