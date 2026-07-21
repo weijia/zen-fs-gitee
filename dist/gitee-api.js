@@ -75,13 +75,12 @@ export class GiteeAPI {
         // API to create an initial file which implicitly creates the branch.
         console.log(`[GiteeAPI] falling back to Contents API to initialize branch '${newBranch}'`);
         const content = btoa('');
-        await this.request(`/repos/${this.owner}/${this.repo}/contents/.gitkeep`, {
+        await this.request(`/repos/${this.owner}/${this.repo}/contents/.gitkeep?branch=${newBranch}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 content,
                 message: `Initialize branch '${newBranch}'`,
-                branch: newBranch,
             }),
         });
         console.log(`[GiteeAPI] branch '${newBranch}' initialized via Contents API (.gitkeep)`);
@@ -93,36 +92,33 @@ export class GiteeAPI {
         return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.branch}`);
     }
     async createFile(path, content, message) {
-        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}`, {
+        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 content: encodeBase64(content),
                 message,
-                branch: this.branch,
             }),
         });
     }
     async updateFile(path, content, sha, message) {
-        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}`, {
+        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 content: encodeBase64(content),
                 message,
                 sha,
-                branch: this.branch,
             }),
         });
     }
     async deleteFile(path, sha, message) {
-        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}`, {
+        await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 message,
                 sha,
-                branch: this.branch,
             }),
         });
     }
