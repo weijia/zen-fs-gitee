@@ -1,4 +1,4 @@
-import { IndexFS } from '@zenfs/core';
+import { IndexFS, Inode } from '@zenfs/core';
 import { GiteeAPI } from './gitee-api.js';
 import type { GiteeOptions } from './types.js';
 /**
@@ -13,6 +13,11 @@ export declare class GiteeFS extends IndexFS {
     readonly shaCache: Map<string, string>;
     /** In-memory content cache to support synchronous reads. */
     readonly contentCache: Map<string, Uint8Array<ArrayBufferLike>>;
+    /** Cached file mtime entries: path -> { sha, lastModified }. Populated lazily via Commits API. */
+    readonly mtimeCache: Map<string, {
+        sha: string;
+        lastModified: string;
+    }>;
     /** Serializes async background operations. */
     private pending;
     private options;
@@ -43,5 +48,17 @@ export declare class GiteeFS extends IndexFS {
     writeSync(path: string, data: Uint8Array, offset: number): void;
     sync(): Promise<void>;
     syncSync(): void;
+    /**
+     * Get the stat of a file. For regular files, this enriches the Inode's
+     * mtimeMs with the real last commit date from the Gitee Commits API.
+     * The first call for a file triggers an API request; subsequent calls
+     * use the cached value unless the blob SHA has changed.
+     */
+    stat(path: string): Promise<Inode>;
+    /**
+     * Get the blob SHA for a file (from shaCache). Useful for external
+     * revision checking (e.g. zen-fs-cache getRevision).
+     */
+    getFileSha(path: string): string | undefined;
 }
 //# sourceMappingURL=gitee-fs.d.ts.map

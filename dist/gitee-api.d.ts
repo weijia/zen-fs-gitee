@@ -54,5 +54,13 @@ export declare class GiteeAPI {
      * Get the current blob SHA of a file via the Contents API.
      */
     getFileSha(path: string): Promise<string | null>;
+    /**
+     * Get the last commit for a specific file path.
+     * Returns the committer date as an ISO string.
+     */
+    getLastCommit(path: string): Promise<{
+        date: string;
+        sha: string;
+    } | null>;
 }
 //# sourceMappingURL=gitee-api.d.ts.map

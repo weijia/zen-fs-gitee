@@ -146,4 +146,60 @@ describe('GiteeAPI', () => {
 
 		await expect(api.getContents('/missing')).rejects.toThrow('Gitee API 404');
 	});
+
+	it('getLastCommit calls correct URL and returns date', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [
+				{
+					sha: 'commit-sha-abc',
+					commit: { committer: { date: '2025-03-10T08:00:00+08:00' } },
+				},
+			],
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		const result = await api.getLastCommit('/docs/notes.md');
+
+		expect(result).not.toBeNull();
+		expect(result!.date).toBe('2025-03-10T08:00:00+08:00');
+		expect(result!.sha).toBe('commit-sha-abc');
+
+		const url = fetchSpy.mock.calls[0][0] as string;
+		expect(url).toContain('/repos/test-owner/test-repo/commits');
+		expect(url).toContain('path=docs/notes.md');
+		expect(url).toContain('ref=main');
+		expect(url).toContain('per_page=1');
+	});
+
+	it('getLastCommit returns null on empty result', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [],
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		const result = await api.getLastCommit('/empty.md');
+		expect(result).toBeNull();
+	});
+
+	it('getLastCommit returns null on API error', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: false,
+			status: 500,
+			headers: new Headers({}),
+			json: async () => ({ message: 'Server Error' }),
+			text: async () => 'Server Error',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		const result = await api.getLastCommit('/broken.md');
+		expect(result).toBeNull();
+	});
 });

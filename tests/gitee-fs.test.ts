@@ -270,5 +270,133 @@ describe('GiteeFS', () => {
 
 			expect(() => fs.statSync('/missing')).toThrow();
 		});
+
+		it('async stat fetches last commit date for files', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			// Mock getLastCommit API response
+			fetchSpy.mockResolvedValueOnce(mockOkJson([
+				{
+					sha: 'commit-sha-1',
+					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+				},
+			]));
+
+			const inode = await fs.stat('/notes.md');
+			expect(inode.size).toBe(50);
+			expect(inode.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+
+			// Should be cached in mtimeCache
+			expect(fs.mtimeCache.get('/notes.md')).toEqual({
+				sha: 'sha1',
+				lastModified: '2025-01-15T10:30:00+08:00',
+			});
+		});
+
+		it('async stat uses cached mtime on second call', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValueOnce(mockOkJson([
+				{
+					sha: 'commit-sha-1',
+					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+				},
+			]));
+
+			const inode1 = await fs.stat('/notes.md');
+			expect(inode1.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+
+			// Second call should NOT trigger another fetch (cached)
+			const inode2 = await fs.stat('/notes.md');
+			expect(inode2.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+
+			// fetchSpy: 1 (tree) + 1 (getLastCommit) = 2 total
+			expect(fetchSpy).toHaveBeenCalledTimes(2);
+		});
+
+		it('async stat re-fetches mtime when SHA changes', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			// First stat
+			fetchSpy.mockResolvedValueOnce(mockOkJson([
+				{
+					sha: 'commit-1',
+					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+				},
+			]));
+			await fs.stat('/notes.md');
+
+			// Simulate SHA change (e.g. remote update)
+			fs.shaCache.set('/notes.md', 'sha2');
+
+			// Second stat should fetch new commit date
+			fetchSpy.mockResolvedValueOnce(mockOkJson([
+				{
+					sha: 'commit-2',
+					commit: { committer: { date: '2025-06-20T14:00:00+08:00' } },
+				},
+			]));
+			const inode = await fs.stat('/notes.md');
+			expect(inode.mtimeMs).toBe(new Date('2025-06-20T14:00:00+08:00').getTime());
+			expect(fs.mtimeCache.get('/notes.md')!.sha).toBe('sha2');
+		});
+
+		it('async stat returns inode as-is for directories', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'src', type: 'tree', sha: 'tree-sha', mode: '040000' },
+			]));
+			await fs.init();
+
+			const inode = await fs.stat('/src');
+			expect((inode.mode & S_IFDIR) === S_IFDIR).toBe(true);
+			});
+
+		it('async stat falls back gracefully when getLastCommit fails', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			// Mock API error
+			fetchSpy.mockResolvedValueOnce({
+				ok: false,
+				status: 500,
+				headers: new Headers({}),
+				json: async () => ({ message: 'Internal Server Error' }),
+				text: async () => 'Internal Server Error',
+				arrayBuffer: async () => new ArrayBuffer(0),
+			} as Response);
+
+			const inode = await fs.stat('/notes.md');
+			// Should still return inode with default mtime
+			expect(inode.size).toBe(50);
+		});
+	});
+
+	describe('getFileSha', () => {
+		it('returns SHA for known file', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'test.txt', type: 'blob', sha: 'file-sha-123', size: 10, mode: '100644' },
+			]));
+			await fs.init();
+
+			expect(fs.getFileSha('/test.txt')).toBe('file-sha-123');
+		});
+
+		it('returns undefined for unknown file', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
+			await fs.init();
+
+			expect(fs.getFileSha('/nope.txt')).toBeUndefined();
+		});
 	});
 });

@@ -14,6 +14,8 @@ export class GiteeFS extends IndexFS {
     shaCache = new Map();
     /** In-memory content cache to support synchronous reads. */
     contentCache = new Map();
+    /** Cached file mtime entries: path -> { sha, lastModified }. Populated lazily via Commits API. */
+    mtimeCache = new Map();
     /** Serializes async background operations. */
     pending = Promise.resolve();
     options;
@@ -223,6 +225,43 @@ export class GiteeFS extends IndexFS {
     }
     syncSync() {
         // Background ops are fire-and-forget; nothing to do synchronously
+    }
+    // --- Stat (overridden to provide real mtime from Commits API) ---
+    /**
+     * Get the stat of a file. For regular files, this enriches the Inode's
+     * mtimeMs with the real last commit date from the Gitee Commits API.
+     * The first call for a file triggers an API request; subsequent calls
+     * use the cached value unless the blob SHA has changed.
+     */
+    async stat(path) {
+        const inode = await super.stat(path);
+        // Only enrich mtime for regular files
+        if ((inode.mode & S_IFREG) !== S_IFREG)
+            return inode;
+        const cached = this.mtimeCache.get(path);
+        const currentSha = this.shaCache.get(path);
+        // If cached SHA matches current SHA, use cached mtime
+        if (cached && cached.sha === currentSha && cached.lastModified) {
+            inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
+            return inode;
+        }
+        // SHA changed or no cache — fetch from Commits API
+        if (currentSha) {
+            const commit = await this.api.getLastCommit(path);
+            if (commit) {
+                this.mtimeCache.set(path, { sha: currentSha, lastModified: commit.date });
+                inode.update({ mtimeMs: new Date(commit.date).getTime() });
+                return inode;
+            }
+        }
+        return inode;
+    }
+    /**
+     * Get the blob SHA for a file (from shaCache). Useful for external
+     * revision checking (e.g. zen-fs-cache getRevision).
+     */
+    getFileSha(path) {
+        return this.shaCache.get(path);
     }
 }
 //# sourceMappingURL=gitee-fs.js.map

@@ -211,4 +211,26 @@ export class GiteeAPI {
 			return null;
 		}
 	}
+
+	/**
+	 * Get the last commit for a specific file path.
+	 * Returns the committer date as an ISO string.
+	 */
+	async getLastCommit(path: string): Promise<{ date: string; sha: string } | null> {
+		try {
+			const commits = await this.request(
+				`/repos/${this.owner}/${this.repo}/commits?path=${apiPath(path)}&ref=${this.branch}&per_page=1`
+			) as Array<{ sha: string; commit?: { committer?: { date: string } } }>;
+			if (Array.isArray(commits) && commits.length > 0) {
+				const commit = commits[0];
+				const date = commit.commit?.committer?.date;
+				if (date) {
+					return { date, sha: commit.sha };
+				}
+			}
+			return null;
+		} catch {
+			return null;
+		}
+	}
 }
