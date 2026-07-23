@@ -32,6 +32,7 @@ export declare class GiteeAPI {
     getBranchSha(branch: string): Promise<string>;
     /**
      * Create a new branch from an existing branch or commit SHA.
+     * Handles the case where the repository is completely empty (no branches).
      */
     createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;

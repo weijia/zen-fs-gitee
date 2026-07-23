@@ -72,6 +72,7 @@ export class GiteeAPI {
 
 	/**
 	 * Create a new branch from an existing branch or commit SHA.
+	 * Handles the case where the repository is completely empty (no branches).
 	 */
 	async createBranch(newBranch: string, fromRef: string = 'master'): Promise<void> {
 		console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
@@ -91,33 +92,50 @@ export class GiteeAPI {
 			console.log(`[GiteeAPI] /branches API failed: ${err.message}`);
 		}
 
+		// Try Git API fallback: create an initial commit + branch ref
 		console.log(`[GiteeAPI] falling back to Git API to initialize branch '${newBranch}'`);
-		// Use git/refs + git/commits + git/trees + git/blobs to create the new branch
-		const fromRefSha = await this.getBranchSha(fromRef);
-		if (!fromRefSha) {
-			throw new Error(`Cannot create branch: base ref '${fromRef}' not found`);
+
+		// Try to get the base ref SHA — may fail if repo is completely empty
+		let fromRefSha: string | undefined;
+		try {
+			fromRefSha = await this.getBranchSha(fromRef);
+		} catch {
+			console.log(`[GiteeAPI] base ref '${fromRef}' not found, creating initial commit on empty repo`);
 		}
-		// Get the base tree SHA from the base commit
-		const baseCommit = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${fromRefSha}`);
-		const baseTree = baseCommit?.tree?.sha;
-		if (!baseTree) {
-			throw new Error(`Cannot create branch: base tree not found for '${fromRef}'`);
+
+		// Create a blob for .gitkeep (use non-empty content to avoid API rejections)
+		const blobSha = await this.createBlob(new TextEncoder().encode('\n'));
+
+		if (fromRefSha) {
+			// Base branch exists — create new branch from it
+			const baseCommit = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${fromRefSha}`);
+			const baseTree = baseCommit?.tree?.sha;
+			if (!baseTree) {
+				throw new Error(`Cannot create branch: base tree not found for '${fromRef}'`);
+			}
+			const newTree = await this.createTree(baseTree, '.gitkeep', blobSha);
+			const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, [fromRefSha]);
+			await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					ref: `refs/heads/${newBranch}`,
+					sha: newCommitSha,
+				}),
+			});
+		} else {
+			// Repo is completely empty — create initial commit with no parents
+			const newTree = await this.createTree('', '.gitkeep', blobSha);
+			const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, []);
+			await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					ref: `refs/heads/${newBranch}`,
+					sha: newCommitSha,
+				}),
+			});
 		}
-		// Create empty blob for .gitkeep
-		const blobSha = await this.createBlob(new Uint8Array(0));
-		// Create new tree with .gitkeep added
-		const newTree = await this.createTree(baseTree, '.gitkeep', blobSha);
-		// Create new commit
-		const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, [fromRefSha]);
-		// Create new branch ref
-		await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				ref: `refs/heads/${newBranch}`,
-				sha: newCommitSha,
-			}),
-		});
 		console.log(`[GiteeAPI] branch '${newBranch}' initialized via Git API`);
 	}
 
@@ -149,20 +167,23 @@ export class GiteeAPI {
 	 * Returns the new tree SHA.
 	 */
 	async createTree(baseTree: string, filePath: string, blobSha: string, isDirectory = false): Promise<string> {
+		const body: Record<string, unknown> = {
+			tree: [
+				{
+					path: apiPath(filePath),
+					mode: isDirectory ? '040000' : '100644',
+					type: isDirectory ? 'tree' : 'blob',
+					sha: blobSha,
+				},
+			],
+		};
+		if (baseTree) {
+			body.base_tree = baseTree;
+		}
 		const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				base_tree: baseTree,
-				tree: [
-					{
-						path: apiPath(filePath),
-						mode: isDirectory ? '040000' : '100644',
-						type: isDirectory ? 'tree' : 'blob',
-						sha: blobSha,
-					},
-				],
-			}),
+			body: JSON.stringify(body),
 		});
 		return data?.sha || '';
 	}
