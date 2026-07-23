@@ -37,12 +37,37 @@ export declare class GiteeAPI {
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
     getRaw(path: string): Promise<ArrayBuffer>;
     /**
+     * Create a new blob. Returns the blob SHA.
+     */
+    createBlob(content: Uint8Array): Promise<string>;
+    /**
+     * Create a new tree based on a base tree, adding or updating a single file entry.
+     * Returns the new tree SHA.
+     */
+    createTree(baseTree: string, filePath: string, blobSha: string, isDirectory?: boolean): Promise<string>;
+    /**
+     * Create a new commit. Returns the commit SHA.
+     */
+    createCommit(tree: string, message: string, parents: string[]): Promise<string>;
+    /**
+     * Update a ref (branch) to point to a new commit.
+     */
+    updateRef(ref: string, commitSha: string, force?: boolean): Promise<void>;
+    /**
+     * Create or update a file using the low-level Git API.
+     * This handles empty files which the Contents API rejects with "content is empty".
+     * Returns the new blob SHA.
+     */
+    private createOrUpdateViaGitApi;
+    /**
      * Create a new file. Returns the new blob SHA.
+     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     createFile(path: string, content: Uint8Array, message: string): Promise<string>;
     /**
      * Update an existing file. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
+     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     updateFile(path: string, content: Uint8Array, sha: string, message: string): Promise<string>;
     /**

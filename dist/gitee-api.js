@@ -62,17 +62,34 @@ export class GiteeAPI {
         catch (err) {
             console.log(`[GiteeAPI] /branches API failed: ${err.message}`);
         }
-        console.log(`[GiteeAPI] falling back to Contents API to initialize branch '${newBranch}'`);
-        const content = btoa('');
-        await this.request(`/repos/${this.owner}/${this.repo}/contents/.gitkeep?branch=${newBranch}`, {
+        console.log(`[GiteeAPI] falling back to Git API to initialize branch '${newBranch}'`);
+        // Use git/refs + git/commits + git/trees + git/blobs to create the new branch
+        const fromRefSha = await this.getBranchSha(fromRef);
+        if (!fromRefSha) {
+            throw new Error(`Cannot create branch: base ref '${fromRef}' not found`);
+        }
+        // Get the base tree SHA from the base commit
+        const baseCommit = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${fromRefSha}`);
+        const baseTree = baseCommit?.tree?.sha;
+        if (!baseTree) {
+            throw new Error(`Cannot create branch: base tree not found for '${fromRef}'`);
+        }
+        // Create empty blob for .gitkeep
+        const blobSha = await this.createBlob(new Uint8Array(0));
+        // Create new tree with .gitkeep added
+        const newTree = await this.createTree(baseTree, '.gitkeep', blobSha);
+        // Create new commit
+        const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, [fromRefSha]);
+        // Create new branch ref
+        await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                content,
-                message: `Initialize branch '${newBranch}'`,
+                ref: `refs/heads/${newBranch}`,
+                sha: newCommitSha,
             }),
         });
-        console.log(`[GiteeAPI] branch '${newBranch}' initialized via Contents API (.gitkeep)`);
+        console.log(`[GiteeAPI] branch '${newBranch}' initialized via Git API`);
     }
     async getContents(path) {
         return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.branch}`);
@@ -81,9 +98,106 @@ export class GiteeAPI {
         return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.branch}`);
     }
     /**
+     * Create a new blob. Returns the blob SHA.
+     */
+    async createBlob(content) {
+        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/blobs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                content: encodeBase64(content),
+                encoding: 'base64',
+            }),
+        });
+        return data?.sha || '';
+    }
+    /**
+     * Create a new tree based on a base tree, adding or updating a single file entry.
+     * Returns the new tree SHA.
+     */
+    async createTree(baseTree, filePath, blobSha, isDirectory = false) {
+        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                base_tree: baseTree,
+                tree: [
+                    {
+                        path: apiPath(filePath),
+                        mode: isDirectory ? '040000' : '100644',
+                        type: isDirectory ? 'tree' : 'blob',
+                        sha: blobSha,
+                    },
+                ],
+            }),
+        });
+        return data?.sha || '';
+    }
+    /**
+     * Create a new commit. Returns the commit SHA.
+     */
+    async createCommit(tree, message, parents) {
+        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/commits`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                message,
+                tree,
+                parents,
+            }),
+        });
+        return data?.sha || '';
+    }
+    /**
+     * Update a ref (branch) to point to a new commit.
+     */
+    async updateRef(ref, commitSha, force = false) {
+        await this.request(`/repos/${this.owner}/${this.repo}/git/refs/${ref}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sha: commitSha,
+                force,
+            }),
+        });
+    }
+    /**
+     * Create or update a file using the low-level Git API.
+     * This handles empty files which the Contents API rejects with "content is empty".
+     * Returns the new blob SHA.
+     */
+    async createOrUpdateViaGitApi(path, content, message, existingSha) {
+        // 1. Create blob (empty content is fine for git blob API)
+        const blobSha = await this.createBlob(content);
+        // 2. Get the current branch's latest commit and its tree
+        const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
+        const currentCommitSha = branchData?.object?.sha;
+        if (!currentCommitSha) {
+            throw new Error('Cannot get current branch commit SHA');
+        }
+        const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
+        const baseTree = commitData?.tree?.sha;
+        if (!baseTree) {
+            throw new Error('Cannot get current tree SHA');
+        }
+        // 3. Create new tree with the updated file
+        const newTree = await this.createTree(baseTree, path, blobSha);
+        // 4. Create new commit
+        const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
+        // 5. Update branch ref
+        await this.updateRef(`heads/${this.branch}`, newCommitSha);
+        return blobSha;
+    }
+    /**
      * Create a new file. Returns the new blob SHA.
+     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     async createFile(path, content, message) {
+        // Gitee Contents API rejects empty content — use Git API for empty files
+        if (content.length === 0) {
+            console.log(`[GiteeAPI] empty file detected for ${path}, using Git API instead of Contents API`);
+            return this.createOrUpdateViaGitApi(path, content, message);
+        }
         const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -97,8 +211,14 @@ export class GiteeAPI {
     /**
      * Update an existing file. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
+     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     async updateFile(path, content, sha, message) {
+        // Gitee Contents API rejects empty content — use Git API for empty files
+        if (content.length === 0) {
+            console.log(`[GiteeAPI] empty file detected for update ${path}, using Git API instead of Contents API`);
+            return this.createOrUpdateViaGitApi(path, content, message, sha);
+        }
         try {
             const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
                 method: 'PUT',
