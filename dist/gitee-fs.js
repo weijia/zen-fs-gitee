@@ -2,6 +2,7 @@ import { withErrno } from 'kerium';
 import { IndexFS, Index, Inode } from '@zenfs/core';
 import { S_IFDIR, S_IFREG } from '@zenfs/core/constants';
 import { GiteeAPI } from './gitee-api.js';
+import { mtimePathFor, isMtimeSidecar, shaHash } from './utils.js';
 /**
  * A ZenFS backend for Gitee repositories.
  *
@@ -58,8 +59,14 @@ export class GiteeFS extends IndexFS {
         }
         for (const item of tree) {
             const path = '/' + item.path;
-            const id = this.index._alloc();
             const isDir = item.type === 'tree';
+            // Skip mtime sidecar files — they are internal metadata, not user files.
+            // But cache their SHA so we can delete them atomically later.
+            if (!isDir && isMtimeSidecar(item.path)) {
+                this.shaCache.set(path, item.sha);
+                continue;
+            }
+            const id = this.index._alloc();
             const inode = new Inode({
                 ino: id,
                 data: id + 1,
@@ -102,6 +109,7 @@ export class GiteeFS extends IndexFS {
      * This enables synchronous reads.
      */
     async preloadContents() {
+        // Preload regular file contents from the index
         for (const [path, node] of this.index) {
             if ((node.mode & S_IFREG) !== S_IFREG)
                 continue;
@@ -113,6 +121,21 @@ export class GiteeFS extends IndexFS {
             }
             catch {
                 // Ignore preload errors for individual files
+            }
+        }
+        // Also preload mtime sidecar files (not in index but in shaCache)
+        // so stat() can read mtime without triggering extra API calls
+        for (const [path] of this.shaCache) {
+            if (!isMtimeSidecar(path))
+                continue;
+            if (this.contentCache.has(path))
+                continue;
+            try {
+                const data = new Uint8Array(await this.api.getRaw(path));
+                this.contentCache.set(path, data);
+            }
+            catch {
+                // Ignore preload errors for sidecar files
             }
         }
     }
@@ -131,24 +154,52 @@ export class GiteeFS extends IndexFS {
     }
     // --- Remove ---
     async remove(path) {
-        const sha = this.shaCache.get(path);
-        if (sha) {
-            await this.api.deleteFile(path, sha, `Delete ${path}`);
+        const sidecarPath = mtimePathFor(path);
+        const dataSha = this.shaCache.get(path);
+        const sidecarSha = this.shaCache.get(sidecarPath);
+        // If both data file and sidecar exist, delete them atomically in one commit
+        if (dataSha && sidecarSha) {
+            await this.api.deleteMulti([{ path }, { path: sidecarPath }], `Delete ${path} + sidecar`);
+            this.shaCache.delete(path);
+            this.shaCache.delete(sidecarPath);
+        }
+        else if (dataSha) {
+            // Only data file exists — use single-file delete
+            await this.api.deleteFile(path, dataSha, `Delete ${path}`);
             this.shaCache.delete(path);
         }
+        else if (sidecarSha) {
+            // Only sidecar exists (orphaned) — delete it too
+            await this.api.deleteFile(sidecarPath, sidecarSha, `Delete orphaned sidecar ${sidecarPath}`);
+            this.shaCache.delete(sidecarPath);
+        }
         this.contentCache.delete(path);
+        this.contentCache.delete(sidecarPath);
+        this.mtimeCache.delete(path);
     }
     removeSync(path) {
-        const sha = this.shaCache.get(path);
-        if (sha) {
-            this._queue(this.api
-                .deleteFile(path, sha, `Delete ${path}`)
-                .then(() => {
+        const sidecarPath = mtimePathFor(path);
+        const dataSha = this.shaCache.get(path);
+        const sidecarSha = this.shaCache.get(sidecarPath);
+        if (dataSha && sidecarSha) {
+            this._queue(this.api.deleteMulti([{ path }, { path: sidecarPath }], `Delete ${path} + sidecar`).then(() => {
                 this.shaCache.delete(path);
-            })
+                this.shaCache.delete(sidecarPath);
+            }).catch(() => { }));
+        }
+        else if (dataSha) {
+            this._queue(this.api.deleteFile(path, dataSha, `Delete ${path}`)
+                .then(() => { this.shaCache.delete(path); })
+                .catch(() => { }));
+        }
+        else if (sidecarSha) {
+            this._queue(this.api.deleteFile(sidecarPath, sidecarSha, `Delete orphaned sidecar ${sidecarPath}`)
+                .then(() => { this.shaCache.delete(sidecarPath); })
                 .catch(() => { }));
         }
         this.contentCache.delete(path);
+        this.contentCache.delete(sidecarPath);
+        this.mtimeCache.delete(path);
     }
     // --- Read ---
     async read(path, buffer, start, end) {
@@ -226,26 +277,58 @@ export class GiteeFS extends IndexFS {
     syncSync() {
         // Background ops are fire-and-forget; nothing to do synchronously
     }
-    // --- Stat (overridden to provide real mtime from Commits API) ---
+    // --- Stat (overridden to provide real mtime from sidecar or Commits API) ---
     /**
      * Get the stat of a file. For regular files, this enriches the Inode's
-     * mtimeMs with the real last commit date from the Gitee Commits API.
-     * The first call for a file triggers an API request; subsequent calls
-     * use the cached value unless the blob SHA has changed.
+     * mtimeMs with the real modification time.
+     *
+     * Priority:
+     * 1. Cached mtime (mtimeCache) — if SHA hasn't changed, return cached value
+     * 2. mtime sidecar file (most precise — stores millisecond mtime)
+     * 3. Commits API (second-level precision, fallback for files without sidecar)
+     * 4. Inode's default mtimeMs (set during init or write)
+     *
+     * The sidecar is only checked when the blob SHA has changed (i.e., file
+     * content changed) or there is no cached mtime. This avoids repeated API
+     * calls for unchanged files.
      */
     async stat(path) {
         const inode = await super.stat(path);
         // Only enrich mtime for regular files
         if ((inode.mode & S_IFREG) !== S_IFREG)
             return inode;
-        const cached = this.mtimeCache.get(path);
         const currentSha = this.shaCache.get(path);
-        // If cached SHA matches current SHA, use cached mtime
+        const cached = this.mtimeCache.get(path);
+        // 1. If cached SHA matches current SHA, use cached mtime (no API calls)
         if (cached && cached.sha === currentSha && cached.lastModified) {
             inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
             return inode;
         }
-        // SHA changed or no cache — fetch from Commits API
+        // SHA changed or no cache — need to fetch mtime.
+        // 2. Try reading mtime from sidecar file first (most precise)
+        const sidecarPath = mtimePathFor(path);
+        try {
+            const sidecarData = this.contentCache.get(sidecarPath)
+                || (await this.api.getRaw(sidecarPath));
+            const sidecarBytes = sidecarData instanceof Uint8Array
+                ? sidecarData
+                : new Uint8Array(sidecarData);
+            const mtimeStr = new TextDecoder().decode(sidecarBytes).trim();
+            const mtimeMs = Number(mtimeStr);
+            if (!isNaN(mtimeMs) && mtimeMs > 0) {
+                inode.update({ mtimeMs });
+                this.contentCache.set(sidecarPath, sidecarBytes);
+                // Cache in mtimeCache so subsequent calls don't re-read sidecar
+                if (currentSha) {
+                    this.mtimeCache.set(path, { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() });
+                }
+                return inode;
+            }
+        }
+        catch {
+            // No sidecar exists — fall through to Commits API
+        }
+        // 3. Fall back to Commits API for files without sidecar
         if (currentSha) {
             const commit = await this.api.getLastCommit(path);
             if (commit) {
@@ -255,6 +338,118 @@ export class GiteeFS extends IndexFS {
             }
         }
         return inode;
+    }
+    // -----------------------------------------------------------------------
+    // writeFileWithMtime — write file + mtime sidecar atomically
+    // -----------------------------------------------------------------------
+    /**
+     * Write a file and preserve the specified mtime by writing a sidecar file
+     * (`.filename.mtime`) containing the mtimeMs as a string.
+     *
+     * Both the data file and its sidecar are committed in a single atomic Git
+     * commit using `createOrUpdateMulti`, so other clients never see a partial
+     * state (data without sidecar or vice versa).
+     *
+     * This is called by zen-fs-sync's `copyFile()` to preserve the source
+     * file's real mtime across sync, since Git commit time only has second-level
+     * precision and doesn't reflect the actual file modification time.
+     */
+    async writeFileWithMtime(path, data, mtimeMs) {
+        // Normalize data to Uint8Array
+        const content = typeof data === 'string'
+            ? new TextEncoder().encode(data)
+            : data;
+        // 1. Update content cache
+        this.contentCache.set(path, content);
+        // 2. Update inode with the specified mtime
+        const inode = this.index.get(path);
+        if (inode) {
+            inode.update({ mtimeMs, size: content.length });
+        }
+        // 3. Build sidecar content (mtimeMs as string)
+        const sidecarPath = mtimePathFor(path);
+        const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+        // 4. Atomic commit: data file + sidecar in one commit
+        const result = await this.api.createOrUpdateMulti([
+            { path, content },
+            { path: sidecarPath, content: sidecarContent },
+        ], `Update ${path} (mtime=${mtimeMs})`);
+        // 5. Update SHA caches
+        const dataSha = result.get(path);
+        if (dataSha)
+            this.shaCache.set(path, dataSha);
+        const sidecarSha = result.get(sidecarPath);
+        if (sidecarSha)
+            this.shaCache.set(sidecarPath, sidecarSha);
+        // 6. Cache sidecar content for future stat() reads
+        this.contentCache.set(sidecarPath, sidecarContent);
+    }
+    // -----------------------------------------------------------------------
+    // createSnapshot — efficient snapshot using Git tree API
+    // -----------------------------------------------------------------------
+    /**
+     * Build a file snapshot efficiently using the Git tree API.
+     *
+     * Instead of walking the filesystem and calling `stat()` for each file
+     * (which would trigger N API calls), this method fetches the entire tree
+     * in a single API request and builds the snapshot from tree items.
+     *
+     * Uses `shaHash(blobSha)` as a proxy for `mtimeMs` — different content
+     * produces a different SHA, which produces a different hash value, which
+     * the sync engine detects as a change. This is more reliable than commit
+     * timestamps (which have only second-level precision and may be identical
+     * for multiple files committed together).
+     *
+     * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
+     * don't appear as user-visible files.
+     *
+     * If the Gitee API is unreachable, returns `null` to signal that the
+     * snapshot could not be built.
+     */
+    async createSnapshot(root, filter) {
+        try {
+            const tree = await this.api.getTree(true);
+            const snapshot = new Map();
+            for (const item of tree) {
+                // Skip directories
+                if (item.type === 'tree')
+                    continue;
+                // Skip mtime sidecar files
+                if (isMtimeSidecar(item.path))
+                    continue;
+                const fullPath = '/' + item.path;
+                // Apply root filter: only include files under the specified root
+                const normalizedRoot = root === '/' ? '' : root;
+                if (normalizedRoot && !fullPath.startsWith(normalizedRoot + '/')) {
+                    continue;
+                }
+                // Compute relative path from root
+                const relPath = normalizedRoot
+                    ? fullPath.slice(normalizedRoot.length + 1)
+                    : fullPath.slice(1);
+                // Apply include/exclude prefix filters
+                if (filter) {
+                    if (filter.excludePrefixes?.some(p => relPath.startsWith(p)))
+                        continue;
+                    if (filter.includePrefixes && filter.includePrefixes.length > 0) {
+                        if (!filter.includePrefixes.some(p => relPath.startsWith(p)))
+                            continue;
+                    }
+                }
+                // Use shaHash as mtimeMs proxy: different content → different SHA → different hash
+                const mtimeMsProxy = shaHash(item.sha);
+                snapshot.set(relPath, {
+                    path: relPath,
+                    size: item.size || 0,
+                    mtimeMs: mtimeMsProxy,
+                });
+            }
+            return snapshot;
+        }
+        catch (err) {
+            console.warn(`[GiteeFS] createSnapshot failed:`, err);
+            return null;
+        }
     }
     /**
      * Get the blob SHA for a file (from shaCache). Useful for external

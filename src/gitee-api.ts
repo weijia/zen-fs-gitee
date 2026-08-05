@@ -189,6 +189,34 @@ export class GiteeAPI {
 	}
 
 	/**
+	 * Create a new tree with multiple file entries (atomic multi-file update).
+	 * Each entry can be an add/update (sha provided) or a delete (sha = null).
+	 * Returns the new tree SHA.
+	 */
+	async createMultiTree(
+		baseTree: string,
+		entries: { path: string; mode: string; type: string; sha: string | null }[],
+	): Promise<string> {
+		const body: Record<string, unknown> = {
+			tree: entries.map((e) => ({
+				path: apiPath(e.path),
+				mode: e.mode,
+				type: e.type,
+				sha: e.sha,
+			})),
+		};
+		if (baseTree) {
+			body.base_tree = baseTree;
+		}
+		const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		});
+		return data?.sha || '';
+	}
+
+	/**
 	 * Create a new commit. Returns the commit SHA.
 	 */
 	async createCommit(tree: string, message: string, parents: string[]): Promise<string> {
@@ -383,6 +411,121 @@ export class GiteeAPI {
 				}
 			}
 			return null;
+		} catch {
+			return null;
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Atomic multi-file operations (Git Data API)
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Create or update multiple files in a single atomic commit.
+	 *
+	 * Uses the Git Data API to:
+	 * 1. Create a blob for each file
+	 * 2. Create a single tree containing all file entries
+	 * 3. Create a single commit
+	 * 4. Update the branch ref
+	 *
+	 * This guarantees all files are committed together — no partial state
+	 * is visible to other clients.
+	 *
+	 * @param entries Array of { path, content } objects
+	 * @param message Commit message
+	 * @returns Map of path → blob SHA for each file
+	 */
+	async createOrUpdateMulti(
+		entries: { path: string; content: Uint8Array }[],
+		message: string,
+	): Promise<Map<string, string>> {
+		const result = new Map<string, string>();
+
+		// 1. Create blobs for each file
+		const treeEntries: { path: string; mode: string; type: string; sha: string }[] = [];
+		for (const entry of entries) {
+			const blobSha = await this.createBlob(entry.content);
+			result.set(entry.path, blobSha);
+			treeEntries.push({
+				path: entry.path,
+				mode: '100644',
+				type: 'blob',
+				sha: blobSha,
+			});
+		}
+
+		// 2. Get current branch HEAD commit and its tree
+		const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
+		const currentCommitSha = branchData?.object?.sha;
+		if (!currentCommitSha) {
+			throw new Error('Cannot get current branch commit SHA for multi-commit');
+		}
+
+		const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
+		const baseTree = commitData?.tree?.sha;
+		if (!baseTree) {
+			throw new Error('Cannot get current tree SHA for multi-commit');
+		}
+
+		// 3. Create new tree with all entries
+		const newTree = await this.createMultiTree(baseTree, treeEntries);
+
+		// 4. Create commit and update ref
+		const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
+		await this.updateRef(`heads/${this.branch}`, newCommitSha);
+
+		return result;
+	}
+
+	/**
+	 * Delete multiple files in a single atomic commit.
+	 *
+	 * Uses createMultiTree with sha=null for each entry to mark them as deleted.
+	 *
+	 * @param entries Array of { path, sha } objects (sha is the current blob SHA)
+	 * @param message Commit message
+	 */
+	async deleteMulti(
+		entries: { path: string }[],
+		message: string,
+	): Promise<void> {
+		if (entries.length === 0) return;
+
+		// 1. Get current branch HEAD commit and its tree
+		const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
+		const currentCommitSha = branchData?.object?.sha;
+		if (!currentCommitSha) {
+			throw new Error('Cannot get current branch commit SHA for multi-delete');
+		}
+
+		const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
+		const baseTree = commitData?.tree?.sha;
+		if (!baseTree) {
+			throw new Error('Cannot get current tree SHA for multi-delete');
+		}
+
+		// 2. Create new tree with sha=null for each file to delete
+		const treeEntries = entries.map((e) => ({
+			path: e.path,
+			mode: '100644',
+			type: 'blob',
+			sha: null as string | null, // null = delete
+		}));
+		const newTree = await this.createMultiTree(baseTree, treeEntries);
+
+		// 3. Create commit and update ref
+		const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
+		await this.updateRef(`heads/${this.branch}`, newCommitSha);
+	}
+
+	/**
+	 * Get the latest commit SHA of the configured branch.
+	 * Useful for snapshot comparison without walking the tree.
+	 */
+	async getLatestCommitSha(): Promise<string | null> {
+		try {
+			return await this.getBranchSha(this.branch);
 		} catch {
 			return null;
 		}

@@ -39,6 +39,17 @@ describe('GiteeFS', () => {
 		} as Response;
 	}
 
+	function mockNotFound(): Response {
+		return {
+			ok: false,
+			status: 404,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ message: 'Not Found' }),
+			text: async () => 'Not Found',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response;
+	}
+
 	beforeEach(() => {
 		fs = new GiteeFS({
 			token: 'test-token',
@@ -272,83 +283,91 @@ describe('GiteeFS', () => {
 		});
 
 		it('async stat fetches last commit date for files', async () => {
-			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
-				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
-			]));
-			await fs.init();
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+		]));
+		await fs.init();
 
-			// Mock getLastCommit API response
-			fetchSpy.mockResolvedValueOnce(mockOkJson([
-				{
-					sha: 'commit-sha-1',
-					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
-				},
-			]));
+		// stat() first tries to read mtime sidecar (404 = no sidecar)
+		fetchSpy.mockResolvedValueOnce(mockNotFound());
 
-			const inode = await fs.stat('/notes.md');
-			expect(inode.size).toBe(50);
-			expect(inode.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+		// Mock getLastCommit API response
+		fetchSpy.mockResolvedValueOnce(mockOkJson([
+			{
+				sha: 'commit-sha-1',
+				commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+			},
+		]));
 
-			// Should be cached in mtimeCache
-			expect(fs.mtimeCache.get('/notes.md')).toEqual({
-				sha: 'sha1',
-				lastModified: '2025-01-15T10:30:00+08:00',
-			});
+		const inode = await fs.stat('/notes.md');
+		expect(inode.size).toBe(50);
+		expect(inode.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+
+		// Should be cached in mtimeCache
+		expect(fs.mtimeCache.get('/notes.md')).toEqual({
+			sha: 'sha1',
+			lastModified: '2025-01-15T10:30:00+08:00',
 		});
+	});
 
 		it('async stat uses cached mtime on second call', async () => {
-			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
-				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
-			]));
-			await fs.init();
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+		]));
+		await fs.init();
 
-			fetchSpy.mockResolvedValueOnce(mockOkJson([
-				{
-					sha: 'commit-sha-1',
-					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
-				},
-			]));
+		// stat() first tries to read mtime sidecar (404 = no sidecar)
+		fetchSpy.mockResolvedValueOnce(mockNotFound());
 
-			const inode1 = await fs.stat('/notes.md');
-			expect(inode1.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+		fetchSpy.mockResolvedValueOnce(mockOkJson([
+			{
+				sha: 'commit-sha-1',
+				commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+			},
+		]));
 
-			// Second call should NOT trigger another fetch (cached)
-			const inode2 = await fs.stat('/notes.md');
-			expect(inode2.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+		const inode1 = await fs.stat('/notes.md');
+		expect(inode1.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
 
-			// fetchSpy: 1 (tree) + 1 (getLastCommit) = 2 total
-			expect(fetchSpy).toHaveBeenCalledTimes(2);
-		});
+		// Second call should NOT trigger another fetch (cached)
+		const inode2 = await fs.stat('/notes.md');
+		expect(inode2.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
+
+		// fetchSpy: 1 (tree) + 1 (sidecar 404) + 1 (getLastCommit) = 3 total
+		expect(fetchSpy).toHaveBeenCalledTimes(3);
+	});
 
 		it('async stat re-fetches mtime when SHA changes', async () => {
-			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
-				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
-			]));
-			await fs.init();
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+		]));
+		await fs.init();
 
-			// First stat
-			fetchSpy.mockResolvedValueOnce(mockOkJson([
-				{
-					sha: 'commit-1',
-					commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
-				},
-			]));
-			await fs.stat('/notes.md');
+		// First stat: sidecar 404 + getLastCommit
+		fetchSpy.mockResolvedValueOnce(mockNotFound());
+		fetchSpy.mockResolvedValueOnce(mockOkJson([
+			{
+				sha: 'commit-1',
+				commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
+			},
+		]));
+		await fs.stat('/notes.md');
 
-			// Simulate SHA change (e.g. remote update)
-			fs.shaCache.set('/notes.md', 'sha2');
+		// Simulate SHA change (e.g. remote update)
+		fs.shaCache.set('/notes.md', 'sha2');
 
-			// Second stat should fetch new commit date
-			fetchSpy.mockResolvedValueOnce(mockOkJson([
-				{
-					sha: 'commit-2',
-					commit: { committer: { date: '2025-06-20T14:00:00+08:00' } },
-				},
-			]));
-			const inode = await fs.stat('/notes.md');
-			expect(inode.mtimeMs).toBe(new Date('2025-06-20T14:00:00+08:00').getTime());
-			expect(fs.mtimeCache.get('/notes.md')!.sha).toBe('sha2');
-		});
+		// Second stat should fetch new commit date: sidecar 404 + getLastCommit
+		fetchSpy.mockResolvedValueOnce(mockNotFound());
+		fetchSpy.mockResolvedValueOnce(mockOkJson([
+			{
+				sha: 'commit-2',
+				commit: { committer: { date: '2025-06-20T14:00:00+08:00' } },
+			},
+		]));
+		const inode = await fs.stat('/notes.md');
+		expect(inode.mtimeMs).toBe(new Date('2025-06-20T14:00:00+08:00').getTime());
+		expect(fs.mtimeCache.get('/notes.md')!.sha).toBe('sha2');
+	});
 
 		it('async stat returns inode as-is for directories', async () => {
 			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
@@ -361,26 +380,96 @@ describe('GiteeFS', () => {
 			});
 
 		it('async stat falls back gracefully when getLastCommit fails', async () => {
-			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
-				{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
-			]));
-			await fs.init();
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+		]));
+		await fs.init();
 
-			// Mock API error
-			fetchSpy.mockResolvedValueOnce({
-				ok: false,
-				status: 500,
-				headers: new Headers({}),
-				json: async () => ({ message: 'Internal Server Error' }),
-				text: async () => 'Internal Server Error',
-				arrayBuffer: async () => new ArrayBuffer(0),
-			} as Response);
+		// stat() first tries sidecar (500 error), then Commits API (also fails)
+		fetchSpy.mockResolvedValueOnce({
+			ok: false,
+			status: 500,
+			headers: new Headers({}),
+			json: async () => ({ message: 'Internal Server Error' }),
+			text: async () => 'Internal Server Error',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+		// Commits API also fails
+		fetchSpy.mockResolvedValueOnce({
+			ok: false,
+			status: 500,
+			headers: new Headers({}),
+			json: async () => ({ message: 'Internal Server Error' }),
+			text: async () => 'Internal Server Error',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
 
-			const inode = await fs.stat('/notes.md');
-			// Should still return inode with default mtime
-			expect(inode.size).toBe(50);
-		});
+		const inode = await fs.stat('/notes.md');
+		// Should still return inode with default mtime
+		expect(inode.size).toBe(50);
 	});
+
+	it('async stat reads mtime from sidecar file when present', async () => {
+		const testMtime = 1700000000123;
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
+			{ path: '.notes.md.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+		]));
+		await fs.init();
+
+		// stat() reads sidecar and gets the mtime value
+		fetchSpy.mockResolvedValueOnce(mockRawResponse(String(testMtime)));
+
+		const inode = await fs.stat('/notes.md');
+		expect(inode.mtimeMs).toBe(testMtime);
+
+		// Should NOT call Commits API (sidecar takes priority)
+		// fetchSpy: 1 (tree) + 1 (sidecar raw) = 2 total
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it('init skips sidecar files from index but caches their SHA', async () => {
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'config.json', type: 'blob', sha: 'data-sha', size: 100, mode: '100644' },
+			{ path: '.config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+		]));
+		await fs.init();
+
+		// Data file should be in index
+		expect(fs.index.has('/config.json')).toBe(true);
+		// Sidecar should NOT be in index
+		expect(fs.index.has('/.config.json.mtime')).toBe(false);
+		// But sidecar SHA should be cached
+		expect(fs.shaCache.get('/.config.json.mtime')).toBe('sidecar-sha');
+	});
+
+	it('remove deletes both data file and sidecar atomically', async () => {
+		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+			{ path: 'config.json', type: 'blob', sha: 'data-sha', size: 100, mode: '100644' },
+			{ path: '.config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+		]));
+		await fs.init();
+
+		// Mock the multi-delete API calls:
+		// 1. getBranchSha (refs/heads/main)
+		// 2. get commits/{sha} (for tree SHA)
+		// 3. createMultiTree
+		// 4. createCommit
+		// 5. updateRef
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ object: { sha: 'branch-head-sha' } }));
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ tree: { sha: 'tree-sha' } }));
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ sha: 'new-tree-sha' }));
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ sha: 'new-commit-sha' }));
+		fetchSpy.mockResolvedValueOnce(mockOkJson({}));
+
+		await fs.remove('/config.json');
+
+		// Both SHAs should be removed from cache
+		expect(fs.shaCache.has('/config.json')).toBe(false);
+		expect(fs.shaCache.has('/.config.json.mtime')).toBe(false);
+		expect(fs.contentCache.has('/config.json')).toBe(false);
+	});
+});
 
 	describe('getFileSha', () => {
 		it('returns SHA for known file', async () => {

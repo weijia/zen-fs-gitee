@@ -47,6 +47,17 @@ export declare class GiteeAPI {
      */
     createTree(baseTree: string, filePath: string, blobSha: string, isDirectory?: boolean): Promise<string>;
     /**
+     * Create a new tree with multiple file entries (atomic multi-file update).
+     * Each entry can be an add/update (sha provided) or a delete (sha = null).
+     * Returns the new tree SHA.
+     */
+    createMultiTree(baseTree: string, entries: {
+        path: string;
+        mode: string;
+        type: string;
+        sha: string | null;
+    }[]): Promise<string>;
+    /**
      * Create a new commit. Returns the commit SHA.
      */
     createCommit(tree: string, message: string, parents: string[]): Promise<string>;
@@ -88,5 +99,41 @@ export declare class GiteeAPI {
         date: string;
         sha: string;
     } | null>;
+    /**
+     * Create or update multiple files in a single atomic commit.
+     *
+     * Uses the Git Data API to:
+     * 1. Create a blob for each file
+     * 2. Create a single tree containing all file entries
+     * 3. Create a single commit
+     * 4. Update the branch ref
+     *
+     * This guarantees all files are committed together — no partial state
+     * is visible to other clients.
+     *
+     * @param entries Array of { path, content } objects
+     * @param message Commit message
+     * @returns Map of path → blob SHA for each file
+     */
+    createOrUpdateMulti(entries: {
+        path: string;
+        content: Uint8Array;
+    }[], message: string): Promise<Map<string, string>>;
+    /**
+     * Delete multiple files in a single atomic commit.
+     *
+     * Uses createMultiTree with sha=null for each entry to mark them as deleted.
+     *
+     * @param entries Array of { path, sha } objects (sha is the current blob SHA)
+     * @param message Commit message
+     */
+    deleteMulti(entries: {
+        path: string;
+    }[], message: string): Promise<void>;
+    /**
+     * Get the latest commit SHA of the configured branch.
+     * Useful for snapshot comparison without walking the tree.
+     */
+    getLatestCommitSha(): Promise<string | null>;
 }
 //# sourceMappingURL=gitee-api.d.ts.map
