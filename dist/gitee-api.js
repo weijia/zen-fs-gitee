@@ -87,9 +87,14 @@ export class GiteeAPI {
     }
     /**
      * Create a new file via Contents API. Returns the new blob SHA.
-     * Note: Gitee rejects empty content with "content is empty".
+     * Gitee rejects empty content with "content is empty", so empty files
+     * are stored as a single newline `\n` (1 byte).
+     * Callers should be aware that 0-byte files become 1-byte on Gitee.
      */
     async createFile(path, content, message) {
+        if (content.length === 0) {
+            content = new TextEncoder().encode('\n');
+        }
         const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -103,8 +108,12 @@ export class GiteeAPI {
     /**
      * Update an existing file via Contents API. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
+     * Gitee rejects empty content — empty files are stored as `\n`.
      */
     async updateFile(path, content, sha, message) {
+        if (content.length === 0) {
+            content = new TextEncoder().encode('\n');
+        }
         try {
             const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
                 method: 'PUT',

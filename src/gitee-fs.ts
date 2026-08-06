@@ -268,19 +268,24 @@ export class GiteeFS extends IndexFS {
 		const merged = new Uint8Array(newSize);
 		merged.set(existing);
 		merged.set(data, offset);
-		this.contentCache.set(path, merged);
+
+		// Gitee can't store 0-byte files — use \n as placeholder
+		const writeContent = merged.length === 0
+			? new TextEncoder().encode('\n')
+			: merged;
+		this.contentCache.set(path, writeContent);
 
 		const inode = this.index.get(path);
 		if (inode) {
-			inode.update({ mtimeMs: Date.now(), size: merged.length });
+			inode.update({ mtimeMs: Date.now(), size: writeContent.length });
 		}
 
 		const sha = this.shaCache.get(path);
 		if (sha) {
-			const newSha = await this.api.updateFile(path, merged, sha, `Update ${path}`);
+			const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
 			this.shaCache.set(path, newSha);
 		} else {
-			const newSha = await this.api.createFile(path, merged, `Create ${path}`);
+			const newSha = await this.api.createFile(path, writeContent, `Create ${path}`);
 			this.shaCache.set(path, newSha);
 		}
 	}
@@ -291,18 +296,23 @@ export class GiteeFS extends IndexFS {
 		const merged = new Uint8Array(newSize);
 		merged.set(existing);
 		merged.set(data, offset);
-		this.contentCache.set(path, merged);
+
+		// Gitee can't store 0-byte files — use \n as placeholder
+		const writeContent = merged.length === 0
+			? new TextEncoder().encode('\n')
+			: merged;
+		this.contentCache.set(path, writeContent);
 
 		const inode = this.index.get(path);
 		if (inode) {
-			inode.update({ mtimeMs: Date.now(), size: merged.length });
+			inode.update({ mtimeMs: Date.now(), size: writeContent.length });
 		}
 
 		const sha = this.shaCache.get(path);
 		this._queue(
 			(sha
-				? this.api.updateFile(path, merged, sha, `Update ${path}`)
-				: this.api.createFile(path, merged, `Create ${path}`)
+				? this.api.updateFile(path, writeContent, sha, `Update ${path}`)
+				: this.api.createFile(path, writeContent, `Create ${path}`)
 			)
 				.then((newSha) => {
 					this.shaCache.set(path, newSha);
@@ -414,9 +424,17 @@ export class GiteeFS extends IndexFS {
 	 */
 	async writeFileWithMtime(path: string, data: string | Uint8Array, mtimeMs: number): Promise<void> {
 		// Normalize data to Uint8Array
-		const content = typeof data === 'string'
+		let content = typeof data === 'string'
 			? new TextEncoder().encode(data)
 			: data;
+
+		// Gitee can't store 0-byte files — substitute a single `\n`.
+		// The contentCache and inode must reflect what's actually on Gitee
+		// (1 byte), otherwise snapshot comparisons will always detect a
+		// mismatch and trigger endless re-syncs.
+		if (content.length === 0) {
+			content = new TextEncoder().encode('\n');
+		}
 
 		// Build sidecar content (mtimeMs as string)
 		const sidecarPath = mtimePathFor(path);

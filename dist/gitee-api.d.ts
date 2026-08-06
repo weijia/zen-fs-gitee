@@ -51,12 +51,15 @@ export declare class GiteeAPI {
     getRaw(path: string): Promise<ArrayBuffer>;
     /**
      * Create a new file via Contents API. Returns the new blob SHA.
-     * Note: Gitee rejects empty content with "content is empty".
+     * Gitee rejects empty content with "content is empty", so empty files
+     * are stored as a single newline `\n` (1 byte).
+     * Callers should be aware that 0-byte files become 1-byte on Gitee.
      */
     createFile(path: string, content: Uint8Array, message: string): Promise<string>;
     /**
      * Update an existing file via Contents API. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
+     * Gitee rejects empty content — empty files are stored as `\n`.
      */
     updateFile(path: string, content: Uint8Array, sha: string, message: string): Promise<string>;
     /**

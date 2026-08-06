@@ -97,6 +97,24 @@ describe('GiteeAPI', () => {
 		expect(body.content).toBe('aGVsbG8=');
 	});
 
+	it('createFile substitutes \\n for empty content', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 201,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ content: { sha: 'empty-sha' } }),
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		await api.createFile('/.keep', new Uint8Array(0), 'create empty');
+
+		const [_url, init] = fetchSpy.mock.calls[0];
+		const body = JSON.parse(init?.body as string);
+		// \n in base64 is "Cg=="
+		expect(body.content).toBe('Cg==');
+	});
+
 	it('updateFile sends PUT with sha', async () => {
 		fetchSpy.mockResolvedValueOnce({
 			ok: true,
