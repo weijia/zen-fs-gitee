@@ -65,6 +65,8 @@ export function sidecarToDataPath(sidecarPath) {
     if (!fileName.startsWith('.') || !fileName.endsWith('.mtime'))
         return null;
     const dataFilename = fileName.slice(1, -6); // remove leading '.' and trailing '.mtime'
+    if (dataFilename === '')
+        return null; // e.g. '.mtime' has no filename between dot and .mtime
     return `${dir}${dataFilename}`;
 }
 /**

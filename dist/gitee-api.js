@@ -1,4 +1,15 @@
 import { apiPath, encodeBase64 } from './utils.js';
+/**
+ * Gitee API v5 wrapper.
+ *
+ * Only the Contents API (POST/PUT/DELETE /repos/{owner}/{repo}/contents/{path})
+ * is used for write operations, because Gitee does NOT support the Git Data API
+ * write endpoints (POST /git/blobs, POST /git/trees, POST /git/commits,
+ * PATCH /git/refs). Those endpoints return 404 on Gitee.
+ *
+ * Git Data API GET endpoints (getTree, getBranchSha) are supported and used
+ * for read-only operations.
+ */
 export class GiteeAPI {
     token;
     owner;
@@ -31,83 +42,43 @@ export class GiteeAPI {
         }
         return response.arrayBuffer();
     }
+    // -----------------------------------------------------------------------
+    // Read-only Git Data API (supported by Gitee)
+    // -----------------------------------------------------------------------
     async getTree(recursive = true) {
         const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees/${this.branch}?recursive=${recursive ? 1 : 0}`);
         return data.tree || [];
     }
     /**
-     * Get the latest commit SHA of a branch.
+     * Get the latest commit SHA of a branch via the Git refs API (GET, supported).
      */
     async getBranchSha(branch) {
         const data = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${branch}`);
         return data.object?.sha;
     }
+    // -----------------------------------------------------------------------
+    // Branch creation (POST /branches, supported by Gitee)
+    // -----------------------------------------------------------------------
     /**
-     * Create a new branch from an existing branch or commit SHA.
-     * Handles the case where the repository is completely empty (no branches).
+     * Create a new branch from an existing branch.
+     * Uses POST /repos/{owner}/{repo}/branches — the only branch-creation
+     * endpoint supported by Gitee.
      */
     async createBranch(newBranch, fromRef = 'master') {
         console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
-        try {
-            await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    branch_name: newBranch,
-                    refs: fromRef,
-                }),
-            });
-            console.log(`[GiteeAPI] branch '${newBranch}' created via /branches API`);
-            return;
-        }
-        catch (err) {
-            console.log(`[GiteeAPI] /branches API failed: ${err.message}`);
-        }
-        // Try Git API fallback: create an initial commit + branch ref
-        console.log(`[GiteeAPI] falling back to Git API to initialize branch '${newBranch}'`);
-        // Try to get the base ref SHA — may fail if repo is completely empty
-        let fromRefSha;
-        try {
-            fromRefSha = await this.getBranchSha(fromRef);
-        }
-        catch {
-            console.log(`[GiteeAPI] base ref '${fromRef}' not found, creating initial commit on empty repo`);
-        }
-        // Create a blob for .gitkeep (use non-empty content to avoid API rejections)
-        const blobSha = await this.createBlob(new TextEncoder().encode('\n'));
-        if (fromRefSha) {
-            // Base branch exists — create new branch from it
-            const baseCommit = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${fromRefSha}`);
-            const baseTree = baseCommit?.tree?.sha;
-            if (!baseTree) {
-                throw new Error(`Cannot create branch: base tree not found for '${fromRef}'`);
-            }
-            const newTree = await this.createTree(baseTree, '.gitkeep', blobSha);
-            const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, [fromRefSha]);
-            await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ref: `refs/heads/${newBranch}`,
-                    sha: newCommitSha,
-                }),
-            });
-        }
-        else {
-            // Repo is completely empty — create initial commit with no parents
-            const newTree = await this.createTree('', '.gitkeep', blobSha);
-            const newCommitSha = await this.createCommit(newTree, `Initialize branch '${newBranch}'`, []);
-            await this.request(`/repos/${this.owner}/${this.repo}/git/refs`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ref: `refs/heads/${newBranch}`,
-                    sha: newCommitSha,
-                }),
-            });
-        }
-        console.log(`[GiteeAPI] branch '${newBranch}' initialized via Git API`);
+        await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                branch_name: newBranch,
+                refs: fromRef,
+            }),
+        });
+        console.log(`[GiteeAPI] branch '${newBranch}' created`);
     }
+    // -----------------------------------------------------------------------
+    // Contents API (GET / POST / PUT / DELETE — all supported by Gitee)
+    // -----------------------------------------------------------------------
     async getContents(path) {
         return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.branch}`);
     }
@@ -115,133 +86,10 @@ export class GiteeAPI {
         return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.branch}`);
     }
     /**
-     * Create a new blob. Returns the blob SHA.
-     */
-    async createBlob(content) {
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/blobs`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                content: encodeBase64(content),
-                encoding: 'base64',
-            }),
-        });
-        return data?.sha || '';
-    }
-    /**
-     * Create a new tree based on a base tree, adding or updating a single file entry.
-     * Returns the new tree SHA.
-     */
-    async createTree(baseTree, filePath, blobSha, isDirectory = false) {
-        const body = {
-            tree: [
-                {
-                    path: apiPath(filePath),
-                    mode: isDirectory ? '040000' : '100644',
-                    type: isDirectory ? 'tree' : 'blob',
-                    sha: blobSha,
-                },
-            ],
-        };
-        if (baseTree) {
-            body.base_tree = baseTree;
-        }
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        return data?.sha || '';
-    }
-    /**
-     * Create a new tree with multiple file entries (atomic multi-file update).
-     * Each entry can be an add/update (sha provided) or a delete (sha = null).
-     * Returns the new tree SHA.
-     */
-    async createMultiTree(baseTree, entries) {
-        const body = {
-            tree: entries.map((e) => ({
-                path: apiPath(e.path),
-                mode: e.mode,
-                type: e.type,
-                sha: e.sha,
-            })),
-        };
-        if (baseTree) {
-            body.base_tree = baseTree;
-        }
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        return data?.sha || '';
-    }
-    /**
-     * Create a new commit. Returns the commit SHA.
-     */
-    async createCommit(tree, message, parents) {
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/commits`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                message,
-                tree,
-                parents,
-            }),
-        });
-        return data?.sha || '';
-    }
-    /**
-     * Update a ref (branch) to point to a new commit.
-     */
-    async updateRef(ref, commitSha, force = false) {
-        await this.request(`/repos/${this.owner}/${this.repo}/git/refs/${ref}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                sha: commitSha,
-                force,
-            }),
-        });
-    }
-    /**
-     * Create or update a file using the low-level Git API.
-     * This handles empty files which the Contents API rejects with "content is empty".
-     * Returns the new blob SHA.
-     */
-    async createOrUpdateViaGitApi(path, content, message, existingSha) {
-        // 1. Create blob (empty content is fine for git blob API)
-        const blobSha = await this.createBlob(content);
-        // 2. Get the current branch's latest commit and its tree
-        const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
-        const currentCommitSha = branchData?.object?.sha;
-        if (!currentCommitSha) {
-            throw new Error('Cannot get current branch commit SHA');
-        }
-        const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
-        const baseTree = commitData?.tree?.sha;
-        if (!baseTree) {
-            throw new Error('Cannot get current tree SHA');
-        }
-        // 3. Create new tree with the updated file
-        const newTree = await this.createTree(baseTree, path, blobSha);
-        // 4. Create new commit
-        const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
-        // 5. Update branch ref
-        await this.updateRef(`heads/${this.branch}`, newCommitSha);
-        return blobSha;
-    }
-    /**
-     * Create a new file. Returns the new blob SHA.
-     * Uses Git API for empty files since Gitee Contents API rejects empty content.
+     * Create a new file via Contents API. Returns the new blob SHA.
+     * Note: Gitee rejects empty content with "content is empty".
      */
     async createFile(path, content, message) {
-        // Gitee Contents API rejects empty content — use Git API for empty files
-        if (content.length === 0) {
-            console.log(`[GiteeAPI] empty file detected for ${path}, using Git API instead of Contents API`);
-            return this.createOrUpdateViaGitApi(path, content, message);
-        }
         const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -253,16 +101,10 @@ export class GiteeAPI {
         return data?.content?.sha || '';
     }
     /**
-     * Update an existing file. Returns the new blob SHA.
+     * Update an existing file via Contents API. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
-     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     async updateFile(path, content, sha, message) {
-        // Gitee Contents API rejects empty content — use Git API for empty files
-        if (content.length === 0) {
-            console.log(`[GiteeAPI] empty file detected for update ${path}, using Git API instead of Contents API`);
-            return this.createOrUpdateViaGitApi(path, content, message, sha);
-        }
         try {
             const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
                 method: 'PUT',
@@ -297,7 +139,7 @@ export class GiteeAPI {
         }
     }
     /**
-     * Delete a file.
+     * Delete a file via Contents API.
      * On "SHA does not match" error, fetches the current SHA and retries once.
      */
     async deleteFile(path, sha, message) {
@@ -332,7 +174,7 @@ export class GiteeAPI {
         }
     }
     /**
-     * Get the current blob SHA of a file via the Contents API.
+     * Get the current blob SHA of a file via the Contents API (GET).
      */
     async getFileSha(path) {
         try {
@@ -343,6 +185,9 @@ export class GiteeAPI {
             return null;
         }
     }
+    // -----------------------------------------------------------------------
+    // Commits API (GET only — supported by Gitee)
+    // -----------------------------------------------------------------------
     /**
      * Get the last commit for a specific file path.
      * Returns the committer date as an ISO string.
@@ -362,91 +207,6 @@ export class GiteeAPI {
         catch {
             return null;
         }
-    }
-    // -----------------------------------------------------------------------
-    // Atomic multi-file operations (Git Data API)
-    // -----------------------------------------------------------------------
-    /**
-     * Create or update multiple files in a single atomic commit.
-     *
-     * Uses the Git Data API to:
-     * 1. Create a blob for each file
-     * 2. Create a single tree containing all file entries
-     * 3. Create a single commit
-     * 4. Update the branch ref
-     *
-     * This guarantees all files are committed together — no partial state
-     * is visible to other clients.
-     *
-     * @param entries Array of { path, content } objects
-     * @param message Commit message
-     * @returns Map of path → blob SHA for each file
-     */
-    async createOrUpdateMulti(entries, message) {
-        const result = new Map();
-        // 1. Create blobs for each file
-        const treeEntries = [];
-        for (const entry of entries) {
-            const blobSha = await this.createBlob(entry.content);
-            result.set(entry.path, blobSha);
-            treeEntries.push({
-                path: entry.path,
-                mode: '100644',
-                type: 'blob',
-                sha: blobSha,
-            });
-        }
-        // 2. Get current branch HEAD commit and its tree
-        const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
-        const currentCommitSha = branchData?.object?.sha;
-        if (!currentCommitSha) {
-            throw new Error('Cannot get current branch commit SHA for multi-commit');
-        }
-        const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
-        const baseTree = commitData?.tree?.sha;
-        if (!baseTree) {
-            throw new Error('Cannot get current tree SHA for multi-commit');
-        }
-        // 3. Create new tree with all entries
-        const newTree = await this.createMultiTree(baseTree, treeEntries);
-        // 4. Create commit and update ref
-        const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
-        await this.updateRef(`heads/${this.branch}`, newCommitSha);
-        return result;
-    }
-    /**
-     * Delete multiple files in a single atomic commit.
-     *
-     * Uses createMultiTree with sha=null for each entry to mark them as deleted.
-     *
-     * @param entries Array of { path, sha } objects (sha is the current blob SHA)
-     * @param message Commit message
-     */
-    async deleteMulti(entries, message) {
-        if (entries.length === 0)
-            return;
-        // 1. Get current branch HEAD commit and its tree
-        const branchData = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${this.branch}`);
-        const currentCommitSha = branchData?.object?.sha;
-        if (!currentCommitSha) {
-            throw new Error('Cannot get current branch commit SHA for multi-delete');
-        }
-        const commitData = await this.request(`/repos/${this.owner}/${this.repo}/git/commits/${currentCommitSha}`);
-        const baseTree = commitData?.tree?.sha;
-        if (!baseTree) {
-            throw new Error('Cannot get current tree SHA for multi-delete');
-        }
-        // 2. Create new tree with sha=null for each file to delete
-        const treeEntries = entries.map((e) => ({
-            path: e.path,
-            mode: '100644',
-            type: 'blob',
-            sha: null, // null = delete
-        }));
-        const newTree = await this.createMultiTree(baseTree, treeEntries);
-        // 3. Create commit and update ref
-        const newCommitSha = await this.createCommit(newTree, message, [currentCommitSha]);
-        await this.updateRef(`heads/${this.branch}`, newCommitSha);
     }
     /**
      * Get the latest commit SHA of the configured branch.

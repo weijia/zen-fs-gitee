@@ -443,24 +443,18 @@ describe('GiteeFS', () => {
 		expect(fs.shaCache.get('/.config.json.mtime')).toBe('sidecar-sha');
 	});
 
-	it('remove deletes both data file and sidecar atomically', async () => {
+	it('remove deletes both data file and sidecar separately via Contents API', async () => {
 		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 			{ path: 'config.json', type: 'blob', sha: 'data-sha', size: 100, mode: '100644' },
 			{ path: '.config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
 		]));
 		await fs.init();
 
-		// Mock the multi-delete API calls:
-		// 1. getBranchSha (refs/heads/main)
-		// 2. get commits/{sha} (for tree SHA)
-		// 3. createMultiTree
-		// 4. createCommit
-		// 5. updateRef
-		fetchSpy.mockResolvedValueOnce(mockOkJson({ object: { sha: 'branch-head-sha' } }));
-		fetchSpy.mockResolvedValueOnce(mockOkJson({ tree: { sha: 'tree-sha' } }));
-		fetchSpy.mockResolvedValueOnce(mockOkJson({ sha: 'new-tree-sha' }));
-		fetchSpy.mockResolvedValueOnce(mockOkJson({ sha: 'new-commit-sha' }));
-		fetchSpy.mockResolvedValueOnce(mockOkJson({}));
+		// Mock the two separate deleteFile calls via Contents API:
+		// 1. deleteFile (data file config.json) -> returns { commit: { sha } }
+		// 2. deleteFile (sidecar .config.json.mtime) -> returns { commit: { sha } }
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ commit: { sha: 'commit-sha' } }));
+		fetchSpy.mockResolvedValueOnce(mockOkJson({ commit: { sha: 'commit-sha' } }));
 
 		await fs.remove('/config.json');
 
@@ -486,6 +480,125 @@ describe('GiteeFS', () => {
 			await fs.init();
 
 			expect(fs.getFileSha('/nope.txt')).toBeUndefined();
+		});
+	});
+
+	describe('writeFileWithMtime', () => {
+		it('writes data file and sidecar in separate Contents API calls', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'old-sha', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			const testMtime = 1700000000123;
+			const testData = '{"key":"value"}';
+
+			// The init tree has config.json with sha 'old-sha', so writeFileWithMtime
+			// calls updateFile for the data file (returns content.sha). No sidecar
+			// exists in the tree, so it calls createFile for the sidecar (returns
+			// content.sha). Each Contents API call is exactly one fetch.
+			// 1. updateFile (data file config.json) -> { content: { sha: 'new-data-sha' } }
+			// 2. createFile (sidecar .config.json.mtime) -> { content: { sha: 'new-sidecar-sha' } }
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-data-sha' } }));
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-sidecar-sha' } }));
+
+			await fs.writeFileWithMtime('/config.json', testData, testMtime);
+
+			// Content cache should be updated
+			const cached = fs.contentCache.get('/config.json');
+			expect(cached).toBeDefined();
+			expect(new TextDecoder().decode(cached!)).toBe(testData);
+
+			// Sidecar content should be cached
+			const sidecarCached = fs.contentCache.get('/.config.json.mtime');
+			expect(sidecarCached).toBeDefined();
+			expect(new TextDecoder().decode(sidecarCached!)).toBe(String(testMtime));
+
+			// SHA caches should be updated with the SHAs returned by the Contents API
+			expect(fs.shaCache.get('/config.json')).toBe('new-data-sha');
+			expect(fs.shaCache.get('/.config.json.mtime')).toBe('new-sidecar-sha');
+		});
+
+		it('accepts Uint8Array data', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
+			await fs.init();
+
+			const testMtime = 1700000000456;
+			const testData = new TextEncoder().encode('binary data');
+
+			// Empty tree (no existing files), so both data and sidecar use createFile.
+			// 1. createFile (data file binary.dat) -> { content: { sha: 'data-sha' } }
+			// 2. createFile (sidecar .binary.dat.mtime) -> { content: { sha: 'sidecar-sha' } }
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'data-sha' } }));
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'sidecar-sha' } }));
+
+			await fs.writeFileWithMtime('/binary.dat', testData, testMtime);
+
+			expect(fs.shaCache.get('/binary.dat')).toBe('data-sha');
+			expect(fs.shaCache.get('/.binary.dat.mtime')).toBe('sidecar-sha');
+		});
+	});
+
+	describe('createSnapshot', () => {
+		it('builds snapshot from Git tree API excluding sidecar files', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'sha-aaa', size: 100, mode: '100644' },
+				{ path: 'notes.md', type: 'blob', sha: 'sha-bbb', size: 50, mode: '100644' },
+				{ path: '.config.json.mtime', type: 'blob', sha: 'sha-sidecar', size: 13, mode: '100644' },
+				{ path: 'src', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'src/index.ts', type: 'blob', sha: 'sha-ccc', size: 200, mode: '100644' },
+			]));
+
+			// createSnapshot fetches tree independently
+			const snapshot = await fs.createSnapshot('/', undefined);
+
+			expect(snapshot).not.toBeNull();
+			expect(snapshot!.size).toBe(3); // config.json, notes.md, src/index.ts (no sidecar, no dir)
+			expect(snapshot!.has('config.json')).toBe(true);
+			expect(snapshot!.has('notes.md')).toBe(true);
+			expect(snapshot!.has('src/index.ts')).toBe(true);
+			expect(snapshot!.has('.config.json.mtime')).toBe(false);
+
+			// Each entry should have shaHash as mtimeMs proxy
+			const entry = snapshot!.get('config.json')!;
+			expect(entry.size).toBe(100);
+			expect(entry.mtimeMs).toBeGreaterThan(0);
+		});
+
+		it('returns null when API is unreachable', async () => {
+			fetchSpy.mockRejectedValueOnce(new Error('Network error'));
+
+			const snapshot = await fs.createSnapshot('/', undefined);
+			expect(snapshot).toBeNull();
+		});
+
+		it('different content produces different mtimeMs proxy', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'a.json', type: 'blob', sha: 'sha-aaa', size: 10, mode: '100644' },
+				{ path: 'b.json', type: 'blob', sha: 'sha-bbb', size: 10, mode: '100644' },
+			]));
+
+			const snapshot = await fs.createSnapshot('/', undefined);
+			expect(snapshot).not.toBeNull();
+
+			const mtimeA = snapshot!.get('a.json')!.mtimeMs;
+			const mtimeB = snapshot!.get('b.json')!.mtimeMs;
+			expect(mtimeA).not.toBe(mtimeB); // Different SHA → different hash
+		});
+
+		it('filters by root path', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'docs/a.md', type: 'blob', sha: 'sha-1', size: 10, mode: '100644' },
+				{ path: 'docs/b.md', type: 'blob', sha: 'sha-2', size: 10, mode: '100644' },
+				{ path: 'config.json', type: 'blob', sha: 'sha-3', size: 10, mode: '100644' },
+			]));
+
+			const snapshot = await fs.createSnapshot('/docs', undefined);
+			expect(snapshot).not.toBeNull();
+			expect(snapshot!.size).toBe(2);
+			expect(snapshot!.has('a.md')).toBe(true);
+			expect(snapshot!.has('b.md')).toBe(true);
+			expect(snapshot!.has('config.json')).toBe(false);
 		});
 	});
 });

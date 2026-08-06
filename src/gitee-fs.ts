@@ -188,21 +188,15 @@ export class GiteeFS extends IndexFS {
 		const dataSha = this.shaCache.get(path);
 		const sidecarSha = this.shaCache.get(sidecarPath);
 
-		// If both data file and sidecar exist, delete them atomically in one commit
-		if (dataSha && sidecarSha) {
-			await this.api.deleteMulti(
-				[{ path }, { path: sidecarPath }],
-				`Delete ${path} + sidecar`
-			);
-			this.shaCache.delete(path);
-			this.shaCache.delete(sidecarPath);
-		} else if (dataSha) {
-			// Only data file exists — use single-file delete
+		// Delete data file and sidecar separately via Contents API.
+		// Gitee only supports the Contents API for file deletion
+		// (DELETE /repos/{owner}/{repo}/contents/{path}).
+		if (dataSha) {
 			await this.api.deleteFile(path, dataSha, `Delete ${path}`);
 			this.shaCache.delete(path);
-		} else if (sidecarSha) {
-			// Only sidecar exists (orphaned) — delete it too
-			await this.api.deleteFile(sidecarPath, sidecarSha, `Delete orphaned sidecar ${sidecarPath}`);
+		}
+		if (sidecarSha) {
+			await this.api.deleteFile(sidecarPath, sidecarSha, `Delete sidecar ${sidecarPath}`);
 			this.shaCache.delete(sidecarPath);
 		}
 
@@ -216,25 +210,18 @@ export class GiteeFS extends IndexFS {
 		const dataSha = this.shaCache.get(path);
 		const sidecarSha = this.shaCache.get(sidecarPath);
 
-		if (dataSha && sidecarSha) {
-			this._queue(
-				this.api.deleteMulti(
-					[{ path }, { path: sidecarPath }],
-					`Delete ${path} + sidecar`
-				).then(() => {
-					this.shaCache.delete(path);
-					this.shaCache.delete(sidecarPath);
-				}).catch(() => {})
-			);
-		} else if (dataSha) {
+		// Delete data file and sidecar separately via Contents API.
+		// See remove() for explanation.
+		if (dataSha) {
 			this._queue(
 				this.api.deleteFile(path, dataSha, `Delete ${path}`)
 					.then(() => { this.shaCache.delete(path); })
 					.catch(() => {})
 			);
-		} else if (sidecarSha) {
+		}
+		if (sidecarSha) {
 			this._queue(
-				this.api.deleteFile(sidecarPath, sidecarSha, `Delete orphaned sidecar ${sidecarPath}`)
+				this.api.deleteFile(sidecarPath, sidecarSha, `Delete sidecar ${sidecarPath}`)
 					.then(() => { this.shaCache.delete(sidecarPath); })
 					.catch(() => {})
 			);
@@ -410,9 +397,16 @@ export class GiteeFS extends IndexFS {
 	 * Write a file and preserve the specified mtime by writing a sidecar file
 	 * (`.filename.mtime`) containing the mtimeMs as a string.
 	 *
-	 * Both the data file and its sidecar are committed in a single atomic Git
-	 * commit using `createOrUpdateMulti`, so other clients never see a partial
-	 * state (data without sidecar or vice versa).
+	 * Uses the Contents API (createFile/updateFile) for both the data file and
+	 * the sidecar, because Gitee only supports the Contents API for file writes.
+	 * The Git Data API write endpoints return 404 on Gitee.
+	 *
+	 * The API calls are made FIRST, and only after both succeed are the local
+	 * caches (contentCache, shaCache, inode) updated. This prevents a situation
+	 * where the cache says the file exists but the remote was never actually
+	 * written — which would cause the sync engine to make incorrect decisions
+	 * on the next cycle (e.g., treating a file as "deleted from source" when
+	 * it was never successfully written).
 	 *
 	 * This is called by zen-fs-sync's `copyFile()` to preserve the source
 	 * file's real mtime across sync, since Git commit time only has second-level
@@ -424,36 +418,39 @@ export class GiteeFS extends IndexFS {
 			? new TextEncoder().encode(data)
 			: data;
 
-		// 1. Update content cache
-		this.contentCache.set(path, content);
+		// Build sidecar content (mtimeMs as string)
+		const sidecarPath = mtimePathFor(path);
+		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
 
-		// 2. Update inode with the specified mtime
+		// 1. Write data file via Contents API
+		const existingDataSha = this.shaCache.get(path);
+		let newDataSha: string;
+		if (existingDataSha) {
+			newDataSha = await this.api.updateFile(path, content, existingDataSha, `Update ${path} (mtime=${mtimeMs})`);
+		} else {
+			newDataSha = await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
+		}
+
+		// 2. Write sidecar file via Contents API
+		const existingSidecarSha = this.shaCache.get(sidecarPath);
+		let newSidecarSha: string;
+		if (existingSidecarSha) {
+			newSidecarSha = await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`);
+		} else {
+			newSidecarSha = await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+		}
+
+		// 3. Only after both API calls succeed, update local caches
+		this.contentCache.set(path, content);
+		this.contentCache.set(sidecarPath, sidecarContent);
+		this.shaCache.set(path, newDataSha);
+		this.shaCache.set(sidecarPath, newSidecarSha);
+
+		// 4. Update inode with the specified mtime
 		const inode = this.index.get(path);
 		if (inode) {
 			inode.update({ mtimeMs, size: content.length });
 		}
-
-		// 3. Build sidecar content (mtimeMs as string)
-		const sidecarPath = mtimePathFor(path);
-		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
-
-		// 4. Atomic commit: data file + sidecar in one commit
-		const result = await this.api.createOrUpdateMulti(
-			[
-				{ path, content },
-				{ path: sidecarPath, content: sidecarContent },
-			],
-			`Update ${path} (mtime=${mtimeMs})`,
-		);
-
-		// 5. Update SHA caches
-		const dataSha = result.get(path);
-		if (dataSha) this.shaCache.set(path, dataSha);
-		const sidecarSha = result.get(sidecarPath);
-		if (sidecarSha) this.shaCache.set(sidecarPath, sidecarSha);
-
-		// 6. Cache sidecar content for future stat() reads
-		this.contentCache.set(sidecarPath, sidecarContent);
 	}
 
 	// -----------------------------------------------------------------------

@@ -116,6 +116,45 @@ describe('GiteeAPI', () => {
 		expect(body.sha).toBe('old-sha');
 	});
 
+	it('updateFile retries with fresh SHA on mismatch', async () => {
+		// First PUT fails with SHA mismatch
+		fetchSpy.mockResolvedValueOnce({
+			ok: false,
+			status: 409,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ message: 'SHA does not match' }),
+			text: async () => 'SHA does not match',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+		// getFileSha GET
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ type: 'file', name: 'test.txt', path: 'test.txt', sha: 'fresh-sha', size: 6 }),
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+		// Retry PUT succeeds
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ content: { sha: 'new-sha' } }),
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		const content = new TextEncoder().encode('updated');
+		const result = await api.updateFile('/test.txt', content, 'old-sha', 'update test');
+		expect(result).toBe('new-sha');
+
+		// Third call should be the retry PUT with fresh SHA
+		const retryInit = fetchSpy.mock.calls[2][1] as RequestInit;
+		const retryBody = JSON.parse(retryInit.body as string);
+		expect(retryBody.sha).toBe('fresh-sha');
+	});
+
 	it('deleteFile sends DELETE with sha', async () => {
 		fetchSpy.mockResolvedValueOnce({
 			ok: true,
@@ -145,6 +184,26 @@ describe('GiteeAPI', () => {
 		} as Response);
 
 		await expect(api.getContents('/missing')).rejects.toThrow('Gitee API 404');
+	});
+
+	it('createBranch sends POST with branch_name and refs', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 201,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({}),
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		await api.createBranch('dev', 'master');
+
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toContain('/repos/test-owner/test-repo/branches');
+		expect(init?.method).toBe('POST');
+		const body = JSON.parse(init?.body as string);
+		expect(body.branch_name).toBe('dev');
+		expect(body.refs).toBe('master');
 	});
 
 	it('getLastCommit calls correct URL and returns date', async () => {
@@ -201,5 +260,28 @@ describe('GiteeAPI', () => {
 
 		const result = await api.getLastCommit('/broken.md');
 		expect(result).toBeNull();
+	});
+
+	// -----------------------------------------------------------------------
+	// getLatestCommitSha
+	// -----------------------------------------------------------------------
+
+	it('getLatestCommitSha returns branch SHA', async () => {
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ object: { sha: 'abc123' } }),
+			text: async () => '', arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		const sha = await api.getLatestCommitSha();
+		expect(sha).toBe('abc123');
+	});
+
+	it('getLatestCommitSha returns null on error', async () => {
+		fetchSpy.mockRejectedValueOnce(new Error('Network error'));
+		const sha = await api.getLatestCommitSha();
+		expect(sha).toBeNull();
 	});
 });

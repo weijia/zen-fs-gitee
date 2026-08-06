@@ -17,6 +17,17 @@ export interface GiteeContentItem {
     encoding?: 'base64';
     download_url?: string;
 }
+/**
+ * Gitee API v5 wrapper.
+ *
+ * Only the Contents API (POST/PUT/DELETE /repos/{owner}/{repo}/contents/{path})
+ * is used for write operations, because Gitee does NOT support the Git Data API
+ * write endpoints (POST /git/blobs, POST /git/trees, POST /git/commits,
+ * PATCH /git/refs). Those endpoints return 404 on Gitee.
+ *
+ * Git Data API GET endpoints (getTree, getBranchSha) are supported and used
+ * for read-only operations.
+ */
 export declare class GiteeAPI {
     private token;
     private owner;
@@ -27,68 +38,34 @@ export declare class GiteeAPI {
     request(path: string, init?: RequestInit): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
     /**
-     * Get the latest commit SHA of a branch.
+     * Get the latest commit SHA of a branch via the Git refs API (GET, supported).
      */
     getBranchSha(branch: string): Promise<string>;
     /**
-     * Create a new branch from an existing branch or commit SHA.
-     * Handles the case where the repository is completely empty (no branches).
+     * Create a new branch from an existing branch.
+     * Uses POST /repos/{owner}/{repo}/branches — the only branch-creation
+     * endpoint supported by Gitee.
      */
     createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
     getRaw(path: string): Promise<ArrayBuffer>;
     /**
-     * Create a new blob. Returns the blob SHA.
-     */
-    createBlob(content: Uint8Array): Promise<string>;
-    /**
-     * Create a new tree based on a base tree, adding or updating a single file entry.
-     * Returns the new tree SHA.
-     */
-    createTree(baseTree: string, filePath: string, blobSha: string, isDirectory?: boolean): Promise<string>;
-    /**
-     * Create a new tree with multiple file entries (atomic multi-file update).
-     * Each entry can be an add/update (sha provided) or a delete (sha = null).
-     * Returns the new tree SHA.
-     */
-    createMultiTree(baseTree: string, entries: {
-        path: string;
-        mode: string;
-        type: string;
-        sha: string | null;
-    }[]): Promise<string>;
-    /**
-     * Create a new commit. Returns the commit SHA.
-     */
-    createCommit(tree: string, message: string, parents: string[]): Promise<string>;
-    /**
-     * Update a ref (branch) to point to a new commit.
-     */
-    updateRef(ref: string, commitSha: string, force?: boolean): Promise<void>;
-    /**
-     * Create or update a file using the low-level Git API.
-     * This handles empty files which the Contents API rejects with "content is empty".
-     * Returns the new blob SHA.
-     */
-    private createOrUpdateViaGitApi;
-    /**
-     * Create a new file. Returns the new blob SHA.
-     * Uses Git API for empty files since Gitee Contents API rejects empty content.
+     * Create a new file via Contents API. Returns the new blob SHA.
+     * Note: Gitee rejects empty content with "content is empty".
      */
     createFile(path: string, content: Uint8Array, message: string): Promise<string>;
     /**
-     * Update an existing file. Returns the new blob SHA.
+     * Update an existing file via Contents API. Returns the new blob SHA.
      * On "SHA does not match" error, fetches the current SHA and retries once.
-     * Uses Git API for empty files since Gitee Contents API rejects empty content.
      */
     updateFile(path: string, content: Uint8Array, sha: string, message: string): Promise<string>;
     /**
-     * Delete a file.
+     * Delete a file via Contents API.
      * On "SHA does not match" error, fetches the current SHA and retries once.
      */
     deleteFile(path: string, sha: string, message: string): Promise<void>;
     /**
-     * Get the current blob SHA of a file via the Contents API.
+     * Get the current blob SHA of a file via the Contents API (GET).
      */
     getFileSha(path: string): Promise<string | null>;
     /**
@@ -99,37 +76,6 @@ export declare class GiteeAPI {
         date: string;
         sha: string;
     } | null>;
-    /**
-     * Create or update multiple files in a single atomic commit.
-     *
-     * Uses the Git Data API to:
-     * 1. Create a blob for each file
-     * 2. Create a single tree containing all file entries
-     * 3. Create a single commit
-     * 4. Update the branch ref
-     *
-     * This guarantees all files are committed together — no partial state
-     * is visible to other clients.
-     *
-     * @param entries Array of { path, content } objects
-     * @param message Commit message
-     * @returns Map of path → blob SHA for each file
-     */
-    createOrUpdateMulti(entries: {
-        path: string;
-        content: Uint8Array;
-    }[], message: string): Promise<Map<string, string>>;
-    /**
-     * Delete multiple files in a single atomic commit.
-     *
-     * Uses createMultiTree with sha=null for each entry to mark them as deleted.
-     *
-     * @param entries Array of { path, sha } objects (sha is the current blob SHA)
-     * @param message Commit message
-     */
-    deleteMulti(entries: {
-        path: string;
-    }[], message: string): Promise<void>;
     /**
      * Get the latest commit SHA of the configured branch.
      * Useful for snapshot comparison without walking the tree.

@@ -70,6 +70,7 @@ export function sidecarToDataPath(sidecarPath: string): string | null {
 	const fileName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
 	if (!fileName.startsWith('.') || !fileName.endsWith('.mtime')) return null;
 	const dataFilename = fileName.slice(1, -6); // remove leading '.' and trailing '.mtime'
+	if (dataFilename === '') return null; // e.g. '.mtime' has no filename between dot and .mtime
 	return `${dir}${dataFilename}`;
 }
 

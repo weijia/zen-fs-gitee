@@ -84,9 +84,16 @@ export declare class GiteeFS extends IndexFS {
      * Write a file and preserve the specified mtime by writing a sidecar file
      * (`.filename.mtime`) containing the mtimeMs as a string.
      *
-     * Both the data file and its sidecar are committed in a single atomic Git
-     * commit using `createOrUpdateMulti`, so other clients never see a partial
-     * state (data without sidecar or vice versa).
+     * Uses the Contents API (createFile/updateFile) for both the data file and
+     * the sidecar, because Gitee only supports the Contents API for file writes.
+     * The Git Data API write endpoints return 404 on Gitee.
+     *
+     * The API calls are made FIRST, and only after both succeed are the local
+     * caches (contentCache, shaCache, inode) updated. This prevents a situation
+     * where the cache says the file exists but the remote was never actually
+     * written — which would cause the sync engine to make incorrect decisions
+     * on the next cycle (e.g., treating a file as "deleted from source" when
+     * it was never successfully written).
      *
      * This is called by zen-fs-sync's `copyFile()` to preserve the source
      * file's real mtime across sync, since Git commit time only has second-level
