@@ -580,4 +580,27 @@ export class GiteeFS extends IndexFS {
 	getFileSha(path: string): string | undefined {
 		return this.shaCache.get(path);
 	}
+
+	/**
+	 * Return a revision token for `path`, implementing the
+	 * {@link CacheableFileSystem.getRevision} hook for zen-fs-cache.
+	 *
+	 * Returns the Git blob SHA from the in-memory `shaCache` — **zero network
+	 * round-trips**. The SHA is populated during `init()` from a single
+	 * `getTree` API call and updated on every `write` / `unlink` from the
+	 * API response.
+	 *
+	 * - For **files**: returns the 40-char blob SHA (e.g. `"a1b2c3..."`).
+	 *   The SHA changes whenever the file content changes, and remains stable
+	 *   when it doesn't — exactly what the cache needs.
+	 * - For **directories**: returns `undefined` (Git has no directory-level
+	 *   blob SHA; tree SHAs are not cached). This causes the cache to re-read
+	 *   the directory listing.
+	 * - For **non-existent paths**: returns `undefined` (path is not in
+	 *   `shaCache`), causing the cache to fall through to a full read which
+	 *   will produce a 404/ENOENT.
+	 */
+	async getRevision(path: string): Promise<string | number | undefined> {
+		return this.shaCache.get(path);
+	}
 }
