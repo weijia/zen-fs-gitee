@@ -365,25 +365,30 @@ export class GiteeFS extends IndexFS {
 		// SHA changed or no cache — need to fetch mtime.
 		// 2. Try reading mtime from sidecar file first (most precise)
 		const sidecarPath = mtimePathFor(path);
-		try {
-			const sidecarData = this.contentCache.get(sidecarPath)
-				|| (await this.api.getRaw(sidecarPath)) as ArrayBuffer;
-			const sidecarBytes = sidecarData instanceof Uint8Array
-				? sidecarData
-				: new Uint8Array(sidecarData);
-			const mtimeStr = new TextDecoder().decode(sidecarBytes).trim();
-			const mtimeMs = Number(mtimeStr);
-			if (!isNaN(mtimeMs) && mtimeMs > 0) {
-				inode.update({ mtimeMs });
-				this.contentCache.set(sidecarPath, sidecarBytes);
-				// Cache in mtimeCache so subsequent calls don't re-read sidecar
-				if (currentSha) {
-					this.mtimeCache.set(path, { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() });
+		// Only attempt to read the sidecar if it exists in shaCache (i.e.,
+		// it was present in the Git tree). This avoids unnecessary 404 API
+		// calls for files that have never been written with writeFileWithMtime.
+		if (this.shaCache.has(sidecarPath) || this.contentCache.has(sidecarPath)) {
+			try {
+				const sidecarData = this.contentCache.get(sidecarPath)
+					|| (await this.api.getRaw(sidecarPath)) as ArrayBuffer;
+				const sidecarBytes = sidecarData instanceof Uint8Array
+					? sidecarData
+					: new Uint8Array(sidecarData);
+				const mtimeStr = new TextDecoder().decode(sidecarBytes).trim();
+				const mtimeMs = Number(mtimeStr);
+				if (!isNaN(mtimeMs) && mtimeMs > 0) {
+					inode.update({ mtimeMs });
+					this.contentCache.set(sidecarPath, sidecarBytes);
+					// Cache in mtimeCache so subsequent calls don't re-read sidecar
+					if (currentSha) {
+						this.mtimeCache.set(path, { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() });
+					}
+					return inode;
 				}
-				return inode;
+			} catch {
+				// Sidecar exists in cache but raw fetch failed — fall through to Commits API
 			}
-		} catch {
-			// No sidecar exists — fall through to Commits API
 		}
 
 		// 3. Fall back to Commits API for files without sidecar

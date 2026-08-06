@@ -288,8 +288,7 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// stat() first tries to read mtime sidecar (404 = no sidecar)
-		fetchSpy.mockResolvedValueOnce(mockNotFound());
+		// No sidecar in tree, so stat() skips getRaw and goes to Commits API
 
 		// Mock getLastCommit API response
 		fetchSpy.mockResolvedValueOnce(mockOkJson([
@@ -316,9 +315,7 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// stat() first tries to read mtime sidecar (404 = no sidecar)
-		fetchSpy.mockResolvedValueOnce(mockNotFound());
-
+		// No sidecar in tree, so stat() skips getRaw and goes to Commits API
 		fetchSpy.mockResolvedValueOnce(mockOkJson([
 			{
 				sha: 'commit-sha-1',
@@ -333,8 +330,8 @@ describe('GiteeFS', () => {
 		const inode2 = await fs.stat('/notes.md');
 		expect(inode2.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
 
-		// fetchSpy: 1 (tree) + 1 (sidecar 404) + 1 (getLastCommit) = 3 total
-		expect(fetchSpy).toHaveBeenCalledTimes(3);
+		// fetchSpy: 1 (tree) + 1 (getLastCommit) = 2 total (no sidecar fetch)
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
 	});
 
 		it('async stat re-fetches mtime when SHA changes', async () => {
@@ -343,8 +340,7 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// First stat: sidecar 404 + getLastCommit
-		fetchSpy.mockResolvedValueOnce(mockNotFound());
+		// First stat: no sidecar in tree, goes to Commits API
 		fetchSpy.mockResolvedValueOnce(mockOkJson([
 			{
 				sha: 'commit-1',
@@ -356,8 +352,7 @@ describe('GiteeFS', () => {
 		// Simulate SHA change (e.g. remote update)
 		fs.shaCache.set('/notes.md', 'sha2');
 
-		// Second stat should fetch new commit date: sidecar 404 + getLastCommit
-		fetchSpy.mockResolvedValueOnce(mockNotFound());
+		// Second stat should fetch new commit date via Commits API
 		fetchSpy.mockResolvedValueOnce(mockOkJson([
 			{
 				sha: 'commit-2',
@@ -385,16 +380,7 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// stat() first tries sidecar (500 error), then Commits API (also fails)
-		fetchSpy.mockResolvedValueOnce({
-			ok: false,
-			status: 500,
-			headers: new Headers({}),
-			json: async () => ({ message: 'Internal Server Error' }),
-			text: async () => 'Internal Server Error',
-			arrayBuffer: async () => new ArrayBuffer(0),
-		} as Response);
-		// Commits API also fails
+		// No sidecar in tree, so stat() goes to Commits API (which fails)
 		fetchSpy.mockResolvedValueOnce({
 			ok: false,
 			status: 500,
