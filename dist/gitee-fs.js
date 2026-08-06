@@ -107,37 +107,55 @@ export class GiteeFS extends IndexFS {
     /**
      * Preload all file contents into memory cache.
      * This enables synchronous reads.
+     *
+     * Uses bounded concurrency (default 8) to parallelize API calls.
+     * Skips tombstone files (.meta/.deleted/) and version sidecar files
+     * (.version) since they are metadata, not user content.
      */
     async preloadContents() {
-        // Preload regular file contents from the index
+        const CONCURRENCY = 8;
+        // Collect all paths that need preloading
+        const pathsToPreload = [];
+        // Regular files from the index
         for (const [path, node] of this.index) {
             if ((node.mode & S_IFREG) !== S_IFREG)
                 continue;
             if (this.contentCache.has(path))
                 continue;
-            try {
-                const data = new Uint8Array(await this.api.getRaw(path));
-                this.contentCache.set(path, data);
-            }
-            catch {
-                // Ignore preload errors for individual files
-            }
+            // Skip tombstone files and version sidecars — they are metadata,
+            // not user content, and are read on demand by the sync engine.
+            if (path.includes('/.meta/.deleted/'))
+                continue;
+            if (path.endsWith('.version'))
+                continue;
+            pathsToPreload.push(path);
         }
-        // Also preload mtime sidecar files (not in index but in shaCache)
-        // so stat() can read mtime without triggering extra API calls
+        // Mtime sidecar files (not in index but in shaCache)
         for (const [path] of this.shaCache) {
             if (!isMtimeSidecar(path))
                 continue;
             if (this.contentCache.has(path))
                 continue;
-            try {
-                const data = new Uint8Array(await this.api.getRaw(path));
-                this.contentCache.set(path, data);
-            }
-            catch {
-                // Ignore preload errors for sidecar files
-            }
+            if (path.includes('/.meta/.deleted/'))
+                continue;
+            pathsToPreload.push(path);
         }
+        // Fetch in parallel with bounded concurrency
+        let index = 0;
+        const fetchOne = async () => {
+            while (index < pathsToPreload.length) {
+                const path = pathsToPreload[index++];
+                try {
+                    const data = new Uint8Array(await this.api.getRaw(path));
+                    this.contentCache.set(path, data);
+                }
+                catch {
+                    // Ignore preload errors for individual files
+                }
+            }
+        };
+        const workers = Array.from({ length: Math.min(CONCURRENCY, pathsToPreload.length) }, () => fetchOne());
+        await Promise.all(workers);
     }
     async ready() {
         if (!this.initialized) {

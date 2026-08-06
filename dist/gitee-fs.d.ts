@@ -53,6 +53,10 @@ export declare class GiteeFS extends IndexFS {
     /**
      * Preload all file contents into memory cache.
      * This enables synchronous reads.
+     *
+     * Uses bounded concurrency (default 8) to parallelize API calls.
+     * Skips tombstone files (.meta/.deleted/) and version sidecar files
+     * (.version) since they are metadata, not user content.
      */
     preloadContents(): Promise<void>;
     ready(): Promise<void>;
