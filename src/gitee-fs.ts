@@ -2,6 +2,7 @@ import { withErrno } from 'kerium';
 import { IndexFS, Index, Inode } from '@zenfs/core';
 import { S_IFDIR, S_IFREG } from '@zenfs/core/constants';
 import type { CreationOptions, InodeLike } from '@zenfs/core';
+import { IdbKVStore } from 'zen-fs-cache';
 import { GiteeAPI, type GiteeTreeItem } from './gitee-api.js';
 import type { GiteeOptions } from './types.js';
 import { mtimePathFor, isMtimeSidecar, sidecarToDataPath, shaHash, apiPath } from './utils.js';
@@ -44,10 +45,23 @@ export class GiteeFS extends IndexFS {
 	private options: GiteeOptions;
 	private initialized = false;
 
+	// --- IndexedDB persistence for internal caches ---
+	/** Persists shaCache (path → blob SHA) across page reloads. */
+	private readonly shaStore: IdbKVStore;
+	/** Persists contentCache (path → file content) across page reloads. */
+	private readonly contentStore: IdbKVStore;
+	/** Persists mtimeCache (path → { sha, lastModified }) across page reloads. */
+	private readonly mtimeStore: IdbKVStore;
+
 	constructor(options: GiteeOptions) {
 		super(0x6769746565, 'gitee', new Index());
 		this.options = options;
 		this.api = new GiteeAPI(options);
+		// Each repo gets its own set of IndexedDB databases, namespaced by owner/repo.
+		const dbBase = `zen-fs-gitee:${options.owner}/${options.repo}`;
+		this.shaStore = new IdbKVStore(`${dbBase}:sha`, 'cache');
+		this.contentStore = new IdbKVStore(`${dbBase}:content`, 'cache');
+		this.mtimeStore = new IdbKVStore(`${dbBase}:mtime`, 'cache');
 	}
 
 	/**
@@ -58,13 +72,79 @@ export class GiteeFS extends IndexFS {
 		this.pending = this.pending.then(() => p).catch(() => {});
 	}
 
+	// --- IndexedDB persistence helpers ---
+
+	/** Persist a single shaCache entry to IndexedDB (fire-and-forget). */
+	private _persistSha(path: string, sha: string): void {
+		this.shaStore.set(path, sha).catch(() => {});
+	}
+
+	/** Persist a single contentCache entry to IndexedDB (fire-and-forget). */
+	private _persistContent(path: string, data: Uint8Array): void {
+		this.contentStore.set(path, data).catch(() => {});
+	}
+
+	/** Persist a single mtimeCache entry to IndexedDB (fire-and-forget). */
+	private _persistMtime(path: string, entry: { sha: string; lastModified: string }): void {
+		this.mtimeStore.set(path, entry).catch(() => {});
+	}
+
+	/** Delete a shaCache entry from IndexedDB (fire-and-forget). */
+	private _deleteSha(path: string): void {
+		this.shaStore.delete(path).catch(() => {});
+	}
+
+	/** Delete a contentCache entry from IndexedDB (fire-and-forget). */
+	private _deleteContent(path: string): void {
+		this.contentStore.delete(path).catch(() => {});
+	}
+
+	/** Delete a mtimeCache entry from IndexedDB (fire-and-forget). */
+	private _deleteMtime(path: string): void {
+		this.mtimeStore.delete(path).catch(() => {});
+	}
+
+	/**
+	 * Load all persistent caches from IndexedDB into the in-memory Maps.
+	 * Called at the start of `init()` to enable a warm start — file contents
+	 * and SHAs from the previous session are immediately available for sync
+	 * reads, avoiding redundant API calls for unchanged files.
+	 */
+	private async loadFromIDB(): Promise<void> {
+		const [shaEntries, contentEntries, mtimeEntries] = await Promise.all([
+			this.shaStore.entries<string>(),
+			this.contentStore.entries<Uint8Array>(),
+			this.mtimeStore.entries<{ sha: string; lastModified: string }>(),
+		]);
+		for (const [path, sha] of shaEntries) {
+			this.shaCache.set(path, sha);
+		}
+		for (const [path, data] of contentEntries) {
+			this.contentCache.set(path, data);
+		}
+		for (const [path, entry] of mtimeEntries) {
+			this.mtimeCache.set(path, entry);
+		}
+		console.log(`[GiteeFS] IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries`);
+	}
+
 	/**
 	 * Initialize the file system by loading the repository tree.
 	 * If the configured branch does not exist, it will be created from 'master'.
+	 *
+	 * Warm start: persistent caches (shaCache, contentCache, mtimeCache) are
+	 * loaded from IndexedDB first, so file contents from the previous session
+	 * are immediately available. The tree API then provides fresh SHAs —
+	 * files whose SHA hasn't changed keep their cached content (zero
+	 * re-fetching), while changed files are invalidated for on-demand re-read.
 	 */
 	async init(): Promise<void> {
 		if (this.initialized) return;
 
+		// 1. Warm start: load persistent caches from IndexedDB
+		await this.loadFromIDB();
+
+		// 2. Fetch fresh tree from API
 		let tree: GiteeTreeItem[] = [];
 		try {
 			tree = await this.api.getTree(true);
@@ -81,14 +161,21 @@ export class GiteeFS extends IndexFS {
 			}
 		}
 
+		// 3. Build index from fresh tree, reusing cached content where SHA is unchanged
+		const freshPaths = new Set<string>();
+		const shaUpdates: [string, string][] = [];
+
 		for (const item of tree) {
 			const path = '/' + item.path;
 			const isDir = item.type === 'tree';
+			freshPaths.add(path);
 
 			// Skip mtime sidecar files — they are internal metadata, not user files.
 			// But cache their SHA so we can delete them atomically later.
 			if (!isDir && isMtimeSidecar(item.path)) {
+				const oldSha = this.shaCache.get(path);
 				this.shaCache.set(path, item.sha);
+				if (oldSha !== item.sha) shaUpdates.push([path, item.sha]);
 				continue;
 			}
 
@@ -108,8 +195,39 @@ export class GiteeFS extends IndexFS {
 			});
 			this.index.set(path, inode);
 			if (!isDir) {
+				const oldSha = this.shaCache.get(path);
 				this.shaCache.set(path, item.sha);
+				shaUpdates.push([path, item.sha]);
+				// If SHA changed, invalidate cached content (will be re-fetched on demand)
+				if (oldSha && oldSha !== item.sha) {
+					this.contentCache.delete(path);
+					this._deleteContent(path);
+					// mtimeCache is also invalid — SHA changed
+					this.mtimeCache.delete(path);
+					this._deleteMtime(path);
+				}
 			}
+		}
+
+		// 4. Remove stale entries (files deleted from remote since last session)
+		const stalePaths: string[] = [];
+		for (const [path] of this.shaCache) {
+			if (!freshPaths.has(path)) {
+				stalePaths.push(path);
+			}
+		}
+		for (const path of stalePaths) {
+			this.shaCache.delete(path);
+			this.contentCache.delete(path);
+			this.mtimeCache.delete(path);
+			this._deleteSha(path);
+			this._deleteContent(path);
+			this._deleteMtime(path);
+		}
+
+		// 5. Bulk-persist updated SHAs to IndexedDB
+		if (shaUpdates.length > 0) {
+			this.shaStore.setMany(shaUpdates).catch(() => {});
 		}
 
 		// Ensure root directory exists
@@ -143,6 +261,9 @@ export class GiteeFS extends IndexFS {
 	 * Uses bounded concurrency (default 8) to parallelize API calls.
 	 * Skips tombstone files (.meta/.deleted/) and version sidecar files
 	 * (.version) since they are metadata, not user content.
+	 *
+	 * Files already in contentCache (restored from IndexedDB during init)
+	 * are skipped — they don't need re-fetching from the API.
 	 */
 	async preloadContents(): Promise<void> {
 		const CONCURRENCY = 8;
@@ -153,7 +274,7 @@ export class GiteeFS extends IndexFS {
 		// Regular files from the index
 		for (const [path, node] of this.index) {
 			if ((node.mode & S_IFREG) !== S_IFREG) continue;
-			if (this.contentCache.has(path)) continue;
+			if (this.contentCache.has(path)) continue; // already cached (from IDB or previous read)
 			// Skip tombstone files and version sidecars — they are metadata,
 			// not user content, and are read on demand by the sync engine.
 			if (path.includes('/.meta/.deleted/')) continue;
@@ -177,6 +298,8 @@ export class GiteeFS extends IndexFS {
 				try {
 					const data = new Uint8Array(await this.api.getRaw(path));
 					this.contentCache.set(path, data);
+					// Persist newly fetched content to IndexedDB
+					this._persistContent(path, data);
 				} catch {
 					// Ignore preload errors for individual files
 				}
@@ -215,15 +338,20 @@ export class GiteeFS extends IndexFS {
 		if (dataSha) {
 			await this.api.deleteFile(path, dataSha, `Delete ${path}`);
 			this.shaCache.delete(path);
+			this._deleteSha(path);
 		}
 		if (sidecarSha) {
 			await this.api.deleteFile(sidecarPath, sidecarSha, `Delete sidecar ${sidecarPath}`);
 			this.shaCache.delete(sidecarPath);
+			this._deleteSha(sidecarPath);
 		}
 
 		this.contentCache.delete(path);
 		this.contentCache.delete(sidecarPath);
+		this._deleteContent(path);
+		this._deleteContent(sidecarPath);
 		this.mtimeCache.delete(path);
+		this._deleteMtime(path);
 		// Remove from the in-memory Index so stat()/exists() correctly
 		// report the file as deleted. Without this, the Index retains a
 		// stale entry and stat() keeps returning the old inode, causing
@@ -242,21 +370,24 @@ export class GiteeFS extends IndexFS {
 		if (dataSha) {
 			this._queue(
 				this.api.deleteFile(path, dataSha, `Delete ${path}`)
-					.then(() => { this.shaCache.delete(path); })
+					.then(() => { this.shaCache.delete(path); this._deleteSha(path); })
 					.catch(() => {})
 			);
 		}
 		if (sidecarSha) {
 			this._queue(
 				this.api.deleteFile(sidecarPath, sidecarSha, `Delete sidecar ${sidecarPath}`)
-					.then(() => { this.shaCache.delete(sidecarPath); })
+					.then(() => { this.shaCache.delete(sidecarPath); this._deleteSha(sidecarPath); })
 					.catch(() => {})
 			);
 		}
 
 		this.contentCache.delete(path);
 		this.contentCache.delete(sidecarPath);
+		this._deleteContent(path);
+		this._deleteContent(sidecarPath);
 		this.mtimeCache.delete(path);
+		this._deleteMtime(path);
 		// Remove from the in-memory Index — see remove() for explanation.
 		this.index.delete(path);
 	}
@@ -269,6 +400,8 @@ export class GiteeFS extends IndexFS {
 		if (!data) {
 			data = new Uint8Array(await this.api.getRaw(path));
 			this.contentCache.set(path, data);
+			// Persist newly fetched content to IndexedDB
+			this._persistContent(path, data);
 		}
 		const length = Math.min(end - start, data.length - start, buffer.length);
 		if (length > 0) {
@@ -303,6 +436,7 @@ export class GiteeFS extends IndexFS {
 			? new TextEncoder().encode('\n')
 			: merged;
 		this.contentCache.set(path, writeContent);
+		this._persistContent(path, writeContent);
 
 		const inode = this.index.get(path);
 		if (inode) {
@@ -313,9 +447,11 @@ export class GiteeFS extends IndexFS {
 		if (sha) {
 			const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
 			this.shaCache.set(path, newSha);
+			this._persistSha(path, newSha);
 		} else {
 			const newSha = await this.api.createFile(path, writeContent, `Create ${path}`);
 			this.shaCache.set(path, newSha);
+			this._persistSha(path, newSha);
 		}
 	}
 
@@ -331,6 +467,7 @@ export class GiteeFS extends IndexFS {
 			? new TextEncoder().encode('\n')
 			: merged;
 		this.contentCache.set(path, writeContent);
+		this._persistContent(path, writeContent);
 
 		const inode = this.index.get(path);
 		if (inode) {
@@ -345,6 +482,7 @@ export class GiteeFS extends IndexFS {
 			)
 				.then((newSha) => {
 					this.shaCache.set(path, newSha);
+					this._persistSha(path, newSha);
 				})
 				.catch(() => {})
 		);
@@ -404,14 +542,20 @@ export class GiteeFS extends IndexFS {
 				const sidecarBytes = sidecarData instanceof Uint8Array
 					? sidecarData
 					: new Uint8Array(sidecarData);
+				// Persist sidecar content if it was fetched from API
+				if (!this.contentCache.has(sidecarPath)) {
+					this.contentCache.set(sidecarPath, sidecarBytes);
+					this._persistContent(sidecarPath, sidecarBytes);
+				}
 				const mtimeStr = new TextDecoder().decode(sidecarBytes).trim();
 				const mtimeMs = Number(mtimeStr);
 				if (!isNaN(mtimeMs) && mtimeMs > 0) {
 					inode.update({ mtimeMs });
-					this.contentCache.set(sidecarPath, sidecarBytes);
 					// Cache in mtimeCache so subsequent calls don't re-read sidecar
 					if (currentSha) {
-						this.mtimeCache.set(path, { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() });
+						const mtimeEntry = { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() };
+						this.mtimeCache.set(path, mtimeEntry);
+						this._persistMtime(path, mtimeEntry);
 					}
 					return inode;
 				}
@@ -424,7 +568,9 @@ export class GiteeFS extends IndexFS {
 		if (currentSha) {
 			const commit = await this.api.getLastCommit(path);
 			if (commit) {
-				this.mtimeCache.set(path, { sha: currentSha, lastModified: commit.date });
+				const mtimeEntry = { sha: currentSha, lastModified: commit.date };
+				this.mtimeCache.set(path, mtimeEntry);
+				this._persistMtime(path, mtimeEntry);
 				inode.update({ mtimeMs: new Date(commit.date).getTime() });
 				return inode;
 			}
@@ -495,8 +641,12 @@ export class GiteeFS extends IndexFS {
 		// 3. Only after both API calls succeed, update local caches
 		this.contentCache.set(path, content);
 		this.contentCache.set(sidecarPath, sidecarContent);
+		this._persistContent(path, content);
+		this._persistContent(sidecarPath, sidecarContent);
 		this.shaCache.set(path, newDataSha);
 		this.shaCache.set(sidecarPath, newSidecarSha);
+		this._persistSha(path, newDataSha);
+		this._persistSha(sidecarPath, newSidecarSha);
 
 		// 4. Update inode with the specified mtime
 		const inode = this.index.get(path);

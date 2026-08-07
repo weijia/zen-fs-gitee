@@ -39,15 +39,46 @@ export declare class GiteeFS extends IndexFS {
     private pending;
     private options;
     private initialized;
+    /** Persists shaCache (path → blob SHA) across page reloads. */
+    private readonly shaStore;
+    /** Persists contentCache (path → file content) across page reloads. */
+    private readonly contentStore;
+    /** Persists mtimeCache (path → { sha, lastModified }) across page reloads. */
+    private readonly mtimeStore;
     constructor(options: GiteeOptions);
     /**
      * Queue an async operation to run after all previous ones finish.
      * Used by sync methods to trigger background writes/deletes.
      */
     private _queue;
+    /** Persist a single shaCache entry to IndexedDB (fire-and-forget). */
+    private _persistSha;
+    /** Persist a single contentCache entry to IndexedDB (fire-and-forget). */
+    private _persistContent;
+    /** Persist a single mtimeCache entry to IndexedDB (fire-and-forget). */
+    private _persistMtime;
+    /** Delete a shaCache entry from IndexedDB (fire-and-forget). */
+    private _deleteSha;
+    /** Delete a contentCache entry from IndexedDB (fire-and-forget). */
+    private _deleteContent;
+    /** Delete a mtimeCache entry from IndexedDB (fire-and-forget). */
+    private _deleteMtime;
+    /**
+     * Load all persistent caches from IndexedDB into the in-memory Maps.
+     * Called at the start of `init()` to enable a warm start — file contents
+     * and SHAs from the previous session are immediately available for sync
+     * reads, avoiding redundant API calls for unchanged files.
+     */
+    private loadFromIDB;
     /**
      * Initialize the file system by loading the repository tree.
      * If the configured branch does not exist, it will be created from 'master'.
+     *
+     * Warm start: persistent caches (shaCache, contentCache, mtimeCache) are
+     * loaded from IndexedDB first, so file contents from the previous session
+     * are immediately available. The tree API then provides fresh SHAs —
+     * files whose SHA hasn't changed keep their cached content (zero
+     * re-fetching), while changed files are invalidated for on-demand re-read.
      */
     init(): Promise<void>;
     /**
@@ -57,6 +88,9 @@ export declare class GiteeFS extends IndexFS {
      * Uses bounded concurrency (default 8) to parallelize API calls.
      * Skips tombstone files (.meta/.deleted/) and version sidecar files
      * (.version) since they are metadata, not user content.
+     *
+     * Files already in contentCache (restored from IndexedDB during init)
+     * are skipped — they don't need re-fetching from the API.
      */
     preloadContents(): Promise<void>;
     ready(): Promise<void>;
@@ -129,5 +163,25 @@ export declare class GiteeFS extends IndexFS {
      * revision checking (e.g. zen-fs-cache getRevision).
      */
     getFileSha(path: string): string | undefined;
+    /**
+     * Return a revision token for `path`, implementing the
+     * {@link CacheableFileSystem.getRevision} hook for zen-fs-cache.
+     *
+     * Returns the Git blob SHA from the in-memory `shaCache` — **zero network
+     * round-trips**. The SHA is populated during `init()` from a single
+     * `getTree` API call and updated on every `write` / `unlink` from the
+     * API response.
+     *
+     * - For **files**: returns the 40-char blob SHA (e.g. `"a1b2c3..."`).
+     *   The SHA changes whenever the file content changes, and remains stable
+     *   when it doesn't — exactly what the cache needs.
+     * - For **directories**: returns `undefined` (Git has no directory-level
+     *   blob SHA; tree SHAs are not cached). This causes the cache to re-read
+     *   the directory listing.
+     * - For **non-existent paths**: returns `undefined` (path is not in
+     *   `shaCache`), causing the cache to fall through to a full read which
+     *   will produce a 404/ENOENT.
+     */
+    getRevision(path: string): Promise<string | number | undefined>;
 }
 //# sourceMappingURL=gitee-fs.d.ts.map
