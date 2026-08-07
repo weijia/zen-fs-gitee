@@ -224,6 +224,12 @@ export class GiteeFS extends IndexFS {
 		this.contentCache.delete(path);
 		this.contentCache.delete(sidecarPath);
 		this.mtimeCache.delete(path);
+		// Remove from the in-memory Index so stat()/exists() correctly
+		// report the file as deleted. Without this, the Index retains a
+		// stale entry and stat() keeps returning the old inode, causing
+		// tombstone processors and sync engines to think the file still
+		// exists and repeatedly attempt deletion.
+		this.index.delete(path);
 	}
 
 	removeSync(path: string): void {
@@ -251,6 +257,8 @@ export class GiteeFS extends IndexFS {
 		this.contentCache.delete(path);
 		this.contentCache.delete(sidecarPath);
 		this.mtimeCache.delete(path);
+		// Remove from the in-memory Index — see remove() for explanation.
+		this.index.delete(path);
 	}
 
 	// --- Read ---
