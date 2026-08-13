@@ -45,6 +45,9 @@ export class GiteeFS extends IndexFS {
 	private options: GiteeOptions;
 	private initialized = false;
 
+	/** Last known commit SHA of the configured branch (baseline for shouldSync). */
+	private lastCommitSha: string | null = null;
+
 	// --- IndexedDB persistence for internal caches ---
 	/** Persists shaCache (path → blob SHA) across page reloads. */
 	private readonly shaStore: IdbKVStore;
@@ -52,6 +55,8 @@ export class GiteeFS extends IndexFS {
 	private readonly contentStore: IdbKVStore;
 	/** Persists mtimeCache (path → { sha, lastModified }) across page reloads. */
 	private readonly mtimeStore: IdbKVStore;
+	/** Persists lastCommitSha across page reloads for shouldSync baseline. */
+	private readonly commitShaStore: IdbKVStore;
 
 	constructor(options: GiteeOptions) {
 		super(0x6769746565, 'gitee', new Index());
@@ -62,6 +67,7 @@ export class GiteeFS extends IndexFS {
 		this.shaStore = new IdbKVStore(`${dbBase}:sha`, 'cache');
 		this.contentStore = new IdbKVStore(`${dbBase}:content`, 'cache');
 		this.mtimeStore = new IdbKVStore(`${dbBase}:mtime`, 'cache');
+		this.commitShaStore = new IdbKVStore(`${dbBase}:commit-sha`, 'cache');
 	}
 
 	/**
@@ -111,10 +117,11 @@ export class GiteeFS extends IndexFS {
 	 * reads, avoiding redundant API calls for unchanged files.
 	 */
 	private async loadFromIDB(): Promise<void> {
-		const [shaEntries, contentEntries, mtimeEntries] = await Promise.all([
+		const [shaEntries, contentEntries, mtimeEntries, savedCommitSha] = await Promise.all([
 			this.shaStore.entries<string>(),
 			this.contentStore.entries<Uint8Array>(),
 			this.mtimeStore.entries<{ sha: string; lastModified: string }>(),
+			this.commitShaStore.get<string>('lastCommitSha'),
 		]);
 		for (const [path, sha] of shaEntries) {
 			this.shaCache.set(path, sha);
@@ -125,7 +132,8 @@ export class GiteeFS extends IndexFS {
 		for (const [path, entry] of mtimeEntries) {
 			this.mtimeCache.set(path, entry);
 		}
-		console.log(`[GiteeFS] IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries`);
+		this.lastCommitSha = savedCommitSha ?? null;
+		console.log(`[GiteeFS] IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
 	}
 
 	/**
@@ -249,6 +257,18 @@ export class GiteeFS extends IndexFS {
 					birthtimeMs: Date.now(),
 				})
 			);
+		}
+
+		// 6. Record current commit SHA as shouldSync baseline
+		//    On first init (no prior baseline), set it so shouldSync doesn't
+		//    force an unnecessary full sync on the very first poll.
+		if (!this.lastCommitSha) {
+			try {
+				this.lastCommitSha = await this.api.getLatestCommitSha();
+				if (this.lastCommitSha) {
+					this.commitShaStore.set('lastCommitSha', this.lastCommitSha).catch(() => {});
+				}
+			} catch { /* non-fatal — shouldSync will return true */ }
 		}
 
 		this.initialized = true;
@@ -760,5 +780,33 @@ export class GiteeFS extends IndexFS {
 	 */
 	async getRevision(path: string): Promise<string | number | undefined> {
 		return this.shaCache.get(path);
+	}
+
+	/**
+	 * Check whether the remote branch has new commits since the last baseline.
+	 *
+	 * Implements the `SyncableFS.shouldSync()` hook for zen-fs-sync. Compares
+	 * the latest commit SHA of the configured branch against the cached
+	 * baseline (`lastCommitSha`). A single API call (`getBranchSha`) is all
+	 * that's needed — no tree walk.
+	 *
+	 * - **SHA unchanged** → `false` (no remote change, skip sync)
+	 * - **SHA changed** → `true`, and the baseline is updated so subsequent
+	 *   polls return `false` until the next external commit
+	 * - **First call (no baseline)** → `true` (triggers initial full sync),
+	 *   then baseline is set
+	 * - **API error** → `true` (fail-safe: trigger sync rather than miss updates)
+	 */
+	async shouldSync(): Promise<boolean> {
+		try {
+			const remoteSha = await this.api.getLatestCommitSha();
+			if (!remoteSha) return true;
+			if (remoteSha === this.lastCommitSha) return false;
+			this.lastCommitSha = remoteSha;
+			this.commitShaStore.set('lastCommitSha', remoteSha).catch(() => {});
+			return true;
+		} catch {
+			return true;
+		}
 	}
 }

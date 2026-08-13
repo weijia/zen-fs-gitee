@@ -39,12 +39,16 @@ export declare class GiteeFS extends IndexFS {
     private pending;
     private options;
     private initialized;
+    /** Last known commit SHA of the configured branch (baseline for shouldSync). */
+    private lastCommitSha;
     /** Persists shaCache (path → blob SHA) across page reloads. */
     private readonly shaStore;
     /** Persists contentCache (path → file content) across page reloads. */
     private readonly contentStore;
     /** Persists mtimeCache (path → { sha, lastModified }) across page reloads. */
     private readonly mtimeStore;
+    /** Persists lastCommitSha across page reloads for shouldSync baseline. */
+    private readonly commitShaStore;
     constructor(options: GiteeOptions);
     /**
      * Queue an async operation to run after all previous ones finish.
@@ -183,5 +187,21 @@ export declare class GiteeFS extends IndexFS {
      *   will produce a 404/ENOENT.
      */
     getRevision(path: string): Promise<string | number | undefined>;
+    /**
+     * Check whether the remote branch has new commits since the last baseline.
+     *
+     * Implements the `SyncableFS.shouldSync()` hook for zen-fs-sync. Compares
+     * the latest commit SHA of the configured branch against the cached
+     * baseline (`lastCommitSha`). A single API call (`getBranchSha`) is all
+     * that's needed — no tree walk.
+     *
+     * - **SHA unchanged** → `false` (no remote change, skip sync)
+     * - **SHA changed** → `true`, and the baseline is updated so subsequent
+     *   polls return `false` until the next external commit
+     * - **First call (no baseline)** → `true` (triggers initial full sync),
+     *   then baseline is set
+     * - **API error** → `true` (fail-safe: trigger sync rather than miss updates)
+     */
+    shouldSync(): Promise<boolean>;
 }
 //# sourceMappingURL=gitee-fs.d.ts.map
