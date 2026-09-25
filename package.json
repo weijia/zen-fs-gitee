@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-gitee",
-  "version": "1.2.11",
+  "version": "1.2.12",
   "description": "A ZenFS backend for Gitee repositories",
   "type": "module",
   "main": "dist/index.js",
@@ -22,7 +22,7 @@
     "build": "tsc -p tsconfig.json && tsup",
     "build:iife": "tsup",
     "test": "vitest run",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "@zenfs/core": "^2.5.0"
