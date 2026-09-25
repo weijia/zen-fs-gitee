@@ -7,17 +7,20 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "browser": "./dist/zen-fs-gitee.global.js",
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
+  "browser": "./dist/zen-fs-gitee.global.js",
   "files": [
     "dist",
     "license.md",
     "readme.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsup",
+    "build:iife": "tsup",
     "test": "vitest run",
     "prepublishOnly": "npm run build && npm test"
   },
@@ -30,6 +33,7 @@
   "devDependencies": {
     "@zenfs/core": "^2.5.7",
     "kerium": "^1.4.2",
+    "tsup": "^8.5.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.10"
   },
