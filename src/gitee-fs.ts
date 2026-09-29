@@ -8,7 +8,7 @@ import { createLogger } from '@richard432/localstorage-logger';
 
 const log = createLogger('GiteeFS');
 import type { GiteeOptions } from './types.js';
-import { mtimePathFor, isMtimeSidecar, sidecarToDataPath, shaHash, apiPath } from './utils.js';
+import { mtimePathFor, sidecarToDataPath, shaHash, apiPath } from './utils.js';
 
 /**
  * Minimal snapshot entry type, compatible with zen-fs-sync's FileSnapshot.
@@ -183,7 +183,9 @@ export class GiteeFS extends IndexFS {
 
 			// Skip mtime sidecar files — they are internal metadata, not user files.
 			// But cache their SHA so we can delete them atomically later.
-			if (!isDir && isMtimeSidecar(item.path)) {
+			// Use sidecarToDataPath (not isMtimeSidecar) so directory-prefixed
+			// paths like `documents/.note.json.mtime` are detected correctly.
+			if (!isDir && sidecarToDataPath(item.path)) {
 				const oldSha = this.shaCache.get(path);
 				this.shaCache.set(path, item.sha);
 				if (oldSha !== item.sha) shaUpdates.push([path, item.sha]);
@@ -307,7 +309,9 @@ export class GiteeFS extends IndexFS {
 
 		// Mtime sidecar files (not in index but in shaCache)
 		for (const [path] of this.shaCache) {
-			if (!isMtimeSidecar(path)) continue;
+			// sidecarToDataPath detects directory-prefixed sidecars correctly
+			// (isMtimeSidecar only matched strings starting with '.').
+			if (!sidecarToDataPath(path)) continue;
 			if (this.contentCache.has(path)) continue;
 			if (path.includes('/.meta/.deleted/')) continue;
 			pathsToPreload.push(path);
@@ -760,11 +764,14 @@ export class GiteeFS extends IndexFS {
 	 * (which would trigger N API calls), this method fetches the entire tree
 	 * in a single API request and builds the snapshot from tree items.
 	 *
-	 * Uses `shaHash(blobSha)` as a proxy for `mtimeMs` — different content
-	 * produces a different SHA, which produces a different hash value, which
-	 * the sync engine detects as a change. This is more reliable than commit
-	 * timestamps (which have only second-level precision and may be identical
-	 * for multiple files committed together).
+	 * mtimeMs is taken from the `.mtime` sidecar when available (the real
+	 * modification time preserved across sync — see DESIGN.md §4), so the
+	 * target-side mtime stays comparable with the source's real mtime. When a
+	 * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
+	 * as a content-stable proxy — different content produces a different SHA,
+	 * which the sync engine detects as a change, and which is more reliable
+	 * than commit timestamps (only second-level precision, shared across files
+	 * committed together).
 	 *
 	 * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
 	 * don't appear as user-visible files.
@@ -780,12 +787,25 @@ export class GiteeFS extends IndexFS {
 			const tree = await this.api.getTree(true);
 			const snapshot = new Map<string, SnapshotEntry>();
 
+			// First pass: index mtime sidecars (data path → sidecar path).
+			// sidecarToDataPath() returns non-null only for `.filename.mtime`
+			// files, so it doubles as a reliable sidecar detector (unlike
+			// isMtimeSidecar(item.path), which fails on directory-prefixed paths).
+			const sidecarByData = new Map<string, string>();
+			for (const item of tree) {
+				if (item.type === 'tree') continue;
+				const dataPath = sidecarToDataPath(item.path);
+				if (dataPath) sidecarByData.set('/' + dataPath, '/' + item.path);
+			}
+
+			// Second pass: build snapshot for real data files.
 			for (const item of tree) {
 				// Skip directories
 				if (item.type === 'tree') continue;
 
-				// Skip mtime sidecar files
-				if (isMtimeSidecar(item.path)) continue;
+				// Skip mtime sidecar files (internal metadata) — also excludes
+				// them from appearing as user-visible files.
+				if (sidecarToDataPath(item.path)) continue;
 
 				const fullPath = '/' + item.path;
 
@@ -808,13 +828,38 @@ export class GiteeFS extends IndexFS {
 					}
 				}
 
-				// Use shaHash as mtimeMs proxy: different content → different SHA → different hash
+				// Default mtime proxy (used only when no real-mtime sidecar is
+				// available). shaHash(blobSha) is stable per content and avoids
+				// the second-level precision issues of commit timestamps.
 				const mtimeMsProxy = shaHash(item.sha);
+
+				// Prefer the real mtime preserved in the `.mtime` sidecar. This
+				// keeps target-side mtime comparable with the source's real
+				// modification time (see DESIGN.md §4) instead of a content hash.
+				let mtimeMs = mtimeMsProxy;
+				const sidecarPath = sidecarByData.get(fullPath);
+				if (sidecarPath) {
+					const cached = this.contentCache.get(sidecarPath);
+					if (cached) {
+						const mtimeStr = new TextDecoder().decode(cached).trim();
+						const parsed = Number(mtimeStr);
+						if (!isNaN(parsed) && parsed > 0) mtimeMs = parsed;
+					} else if (this.shaCache.has(sidecarPath)) {
+						// Sidecar exists remotely but its content isn't cached yet
+						// (e.g. pulled from remote without a prior stat). Fire-and-forget
+						// a fetch so the NEXT snapshot cycle gets the real value.
+						void this.api.getRaw(sidecarPath).then((raw: any) => {
+							const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer);
+							this.contentCache.set(sidecarPath, bytes);
+							this._persistContent(sidecarPath, bytes);
+						}).catch(() => {});
+					}
+				}
 
 				snapshot.set(relPath, {
 					path: relPath,
 					size: item.size || 0,
-					mtimeMs: mtimeMsProxy,
+					mtimeMs,
 				});
 			}
 

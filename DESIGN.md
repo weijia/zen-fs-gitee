@@ -37,6 +37,10 @@ Helpers live in `src/utils.ts`:
 - `isMtimeSidecar(name)` → `true` for `*.mtime` files
 - `sidecarToDataPath(sidecarPath)` → reverse mapping
 
+Note: `mtimePathFor` does not double the leading dot — a file whose name
+already starts with `.` (e.g. `.gitignore`) yields `.gitignore.mtime`, not
+`..gitignore.mtime`. This matches `zen-fs-remotestoragejs`'s `mtimePathFor`.
+
 Lifecycle in `src/gitee-fs.ts`:
 - **Write**: `writeFileWithMtime()` (lines ~628–679) writes the data file
   **and** the sidecar via the Contents API.
@@ -47,6 +51,13 @@ Lifecycle in `src/gitee-fs.ts`:
   4. inode default
 - **Delete**: `remove()` / `removeSync()` delete the data file and the
   sidecar together.
+- **Snapshot**: `createSnapshot()` (lines ~752–826) builds the file snapshot
+  from the Git tree API. It indexes `.mtime` sidecars (via `sidecarToDataPath`)
+  and, for each data file, uses the **real mtime from the sidecar** when its
+  content is cached; otherwise it falls back to `shaHash(blobSha)` (a
+  content-stable proxy) and fire-and-forget-fetches the sidecar so the next
+  snapshot gets the real value. Sidecar files are excluded from the snapshot so
+  they never appear as user-visible files.
 
 ## 4. Known issue: `write()` / `writeSync()` do NOT write the sidecar
 
@@ -68,10 +79,13 @@ back to the Commits API, so `target.mtimeMs` becomes the commit time (e.g.
 (`1785066849718`). They never match → the sync engine re-PUTs the file every
 cycle, producing the "Update … 无差异 / no-diff" commits seen on Gitee.
 
-> Note: `createSnapshot()` (lines ~704–755) additionally uses
-> `shaHash(blobSha)` as an mtime proxy instead of reading the sidecar. That is
-> a separate hazard — if the sync engine ever compares against that snapshot,
-> the synthetic hash is also incompatible with the source's real mtime.
+> Note: `createSnapshot()` (lines ~752–826) previously used `shaHash(blobSha)`
+> as an mtime proxy instead of reading the sidecar — a separate hazard if the
+> sync engine ever compared against that snapshot, since the synthetic hash is
+> incompatible with the source's real mtime. **Fixed in `zen-fs-gitee@1.2.18`**:
+> it now indexes `.mtime` sidecars (via `sidecarToDataPath`, which correctly
+> detects sidecars on directory-prefixed paths) and uses the real mtime, with
+> the shaHash proxy only as a fallback. See §5.
 
 ## 5. Fix
 
@@ -82,10 +96,23 @@ writes the sidecar by default. This closes the loop so that regardless of
 whether the sync engine calls `writeFile` or `writeFileWithMtime`, the sidecar
 is always persisted and `stat()` returns the real mtime.
 
+Additionally, `createSnapshot()` now reads the `.mtime` sidecar for the real
+mtime instead of relying solely on `shaHash(blobSha)`. It indexes sidecars via
+`sidecarToDataPath(item.path)` (which correctly detects sidecars even on
+directory-prefixed paths — unlike `isMtimeSidecar(item.path)`, which only
+matches strings starting with `.` and therefore missed `/foo/.bar.json.mtime`).
+When a sidecar's content is already in `contentCache`, the real mtime is used
+directly; otherwise the shaHash proxy is used and the sidecar is fetched
+asynchronously so the next snapshot gets the real value. This keeps target-side
+mtime comparable with the source's real mtime even on the snapshot-based
+comparison path, and also fixes a latent bug where sidecars leaked into the
+snapshot as user-visible files.
+
 See also `zen-fs-config/DESIGN.md` §13 "Mtime Preservation During Sync" and
 its backend status table.
 
-> **Status**: Implemented in `zen-fs-gitee@1.2.17`. `write()` / `writeSync()`
-> now persist the `.mtime` sidecar, and `writeFile` / `writeFileSync` forward
-> `options.mtime` into the sidecar — so the real mtime survives cross-backend
-> sync and the "no-diff" re-PUTs no longer occur.
+> **Status**:
+> - `write()` / `writeSync()` sidecar fix — `zen-fs-gitee@1.2.17`.
+> - `createSnapshot()` sidecar-read fix — `zen-fs-gitee@1.2.18`.
+>   Both ensure the real mtime survives cross-backend sync and the "no-diff"
+>   re-PUTs no longer occur.

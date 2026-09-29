@@ -162,11 +162,14 @@ export declare class GiteeFS extends IndexFS {
      * (which would trigger N API calls), this method fetches the entire tree
      * in a single API request and builds the snapshot from tree items.
      *
-     * Uses `shaHash(blobSha)` as a proxy for `mtimeMs` — different content
-     * produces a different SHA, which produces a different hash value, which
-     * the sync engine detects as a change. This is more reliable than commit
-     * timestamps (which have only second-level precision and may be identical
-     * for multiple files committed together).
+     * mtimeMs is taken from the `.mtime` sidecar when available (the real
+     * modification time preserved across sync — see DESIGN.md §4), so the
+     * target-side mtime stays comparable with the source's real mtime. When a
+     * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
+     * as a content-stable proxy — different content produces a different SHA,
+     * which the sync engine detects as a change, and which is more reliable
+     * than commit timestamps (only second-level precision, shared across files
+     * committed together).
      *
      * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
      * don't appear as user-visible files.

@@ -18547,10 +18547,17 @@ var ZenFSGitee = (() => {
     const lastSlash = filePath.lastIndexOf("/");
     const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash + 1) : "";
     const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-    return `${dir}.${fileName}.mtime`;
+    const mtimeFileName = fileName.startsWith(".") ? `${fileName}.mtime` : `.${fileName}.mtime`;
+    return `${dir}${mtimeFileName}`;
   }
-  function isMtimeSidecar(name) {
-    return name.startsWith(".") && name.endsWith(".mtime");
+  function sidecarToDataPath(sidecarPath) {
+    const lastSlash = sidecarPath.lastIndexOf("/");
+    const dir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash + 1) : "";
+    const fileName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
+    if (!fileName.startsWith(".") || !fileName.endsWith(".mtime")) return null;
+    const dataFilename = fileName.slice(1, -6);
+    if (dataFilename === "") return null;
+    return `${dir}${dataFilename}`;
   }
   function shaHash(sha) {
     let hash = 0;
@@ -18979,7 +18986,7 @@ var ZenFSGitee = (() => {
         const path = "/" + item.path;
         const isDir = item.type === "tree";
         freshPaths.add(path);
-        if (!isDir && isMtimeSidecar(item.path)) {
+        if (!isDir && sidecarToDataPath(item.path)) {
           const oldSha = this.shaCache.get(path);
           this.shaCache.set(path, item.sha);
           if (oldSha !== item.sha) shaUpdates.push([path, item.sha]);
@@ -19083,7 +19090,7 @@ var ZenFSGitee = (() => {
         pathsToPreload.push(path);
       }
       for (const [path] of this.shaCache) {
-        if (!isMtimeSidecar(path)) continue;
+        if (!sidecarToDataPath(path)) continue;
         if (this.contentCache.has(path)) continue;
         if (path.includes("/.meta/.deleted/")) continue;
         pathsToPreload.push(path);
@@ -19421,11 +19428,14 @@ var ZenFSGitee = (() => {
      * (which would trigger N API calls), this method fetches the entire tree
      * in a single API request and builds the snapshot from tree items.
      *
-     * Uses `shaHash(blobSha)` as a proxy for `mtimeMs` — different content
-     * produces a different SHA, which produces a different hash value, which
-     * the sync engine detects as a change. This is more reliable than commit
-     * timestamps (which have only second-level precision and may be identical
-     * for multiple files committed together).
+     * mtimeMs is taken from the `.mtime` sidecar when available (the real
+     * modification time preserved across sync — see DESIGN.md §4), so the
+     * target-side mtime stays comparable with the source's real mtime. When a
+     * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
+     * as a content-stable proxy — different content produces a different SHA,
+     * which the sync engine detects as a change, and which is more reliable
+     * than commit timestamps (only second-level precision, shared across files
+     * committed together).
      *
      * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
      * don't appear as user-visible files.
@@ -19437,9 +19447,15 @@ var ZenFSGitee = (() => {
       try {
         const tree = await this.api.getTree(true);
         const snapshot = /* @__PURE__ */ new Map();
+        const sidecarByData = /* @__PURE__ */ new Map();
         for (const item of tree) {
           if (item.type === "tree") continue;
-          if (isMtimeSidecar(item.path)) continue;
+          const dataPath = sidecarToDataPath(item.path);
+          if (dataPath) sidecarByData.set("/" + dataPath, "/" + item.path);
+        }
+        for (const item of tree) {
+          if (item.type === "tree") continue;
+          if (sidecarToDataPath(item.path)) continue;
           const fullPath = "/" + item.path;
           const normalizedRoot = root === "/" ? "" : root;
           if (normalizedRoot && !fullPath.startsWith(normalizedRoot + "/")) {
@@ -19453,10 +19469,27 @@ var ZenFSGitee = (() => {
             }
           }
           const mtimeMsProxy = shaHash(item.sha);
+          let mtimeMs = mtimeMsProxy;
+          const sidecarPath = sidecarByData.get(fullPath);
+          if (sidecarPath) {
+            const cached = this.contentCache.get(sidecarPath);
+            if (cached) {
+              const mtimeStr = new TextDecoder().decode(cached).trim();
+              const parsed = Number(mtimeStr);
+              if (!isNaN(parsed) && parsed > 0) mtimeMs = parsed;
+            } else if (this.shaCache.has(sidecarPath)) {
+              void this.api.getRaw(sidecarPath).then((raw) => {
+                const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+                this.contentCache.set(sidecarPath, bytes);
+                this._persistContent(sidecarPath, bytes);
+              }).catch(() => {
+              });
+            }
+          }
           snapshot.set(relPath, {
             path: relPath,
             size: item.size || 0,
-            mtimeMs: mtimeMsProxy
+            mtimeMs
           });
         }
         return snapshot;
