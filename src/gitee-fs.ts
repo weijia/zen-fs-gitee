@@ -4,6 +4,9 @@ import { S_IFDIR, S_IFREG } from '@zenfs/core/constants';
 import type { CreationOptions, InodeLike } from '@zenfs/core';
 import { IdbKVStore } from 'zen-fs-cache';
 import { GiteeAPI, type GiteeTreeItem } from './gitee-api.js';
+import { createLogger } from '@richard432/localstorage-logger';
+
+const log = createLogger('GiteeFS');
 import type { GiteeOptions } from './types.js';
 import { mtimePathFor, isMtimeSidecar, sidecarToDataPath, shaHash, apiPath } from './utils.js';
 
@@ -133,7 +136,7 @@ export class GiteeFS extends IndexFS {
 			this.mtimeCache.set(path, entry);
 		}
 		this.lastCommitSha = savedCommitSha ?? null;
-		console.log(`[GiteeFS] IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
+		log.log(`IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
 	}
 
 	/**
@@ -160,7 +163,7 @@ export class GiteeFS extends IndexFS {
 			const msg = err.message || '';
 			// Branch not found — try to create it
 			if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
-				console.log(`[GiteeFS] Branch '${this.options.branch}' not found, attempting to create...`);
+				log.log(`Branch '${this.options.branch}' not found, attempting to create...`);
 				await this.api.createBranch(this.options.branch || 'master', 'master');
 				// Retry loading tree
 				tree = await this.api.getTree(true);
@@ -746,7 +749,7 @@ export class GiteeFS extends IndexFS {
 
 			return snapshot;
 		} catch (err) {
-			console.warn(`[GiteeFS] createSnapshot failed:`, err);
+			log.warn(`createSnapshot failed:`, err);
 			return null;
 		}
 	}

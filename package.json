@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-gitee",
-  "version": "1.2.12",
+  "version": "1.2.13",
   "description": "A ZenFS backend for Gitee repositories",
   "type": "module",
   "main": "dist/index.js",
@@ -28,7 +28,8 @@
     "@zenfs/core": "^2.5.0"
   },
   "dependencies": {
-    "zen-fs-cache": "^1.0.2"
+    "zen-fs-cache": "^1.0.2",
+    "@richard432/localstorage-logger": "^0.1.0"
   },
   "devDependencies": {
     "@zenfs/core": "^2.5.7",

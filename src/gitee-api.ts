@@ -1,5 +1,8 @@
 import type { GiteeOptions } from './types.js';
 import { apiPath, encodeBase64 } from './utils.js';
+import { createLogger } from '@richard432/localstorage-logger';
+
+const log = createLogger('GiteeAPI');
 
 export interface GiteeTreeItem {
 	path: string;
@@ -50,12 +53,12 @@ export class GiteeAPI {
 	async request(path: string, init?: RequestInit): Promise<any> {
 		const separator = path.includes('?') ? '&' : '?';
 		const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
-		console.log(`[GiteeAPI] request: ${init?.method || 'GET'} ${url}`);
+		log.log(`request: ${init?.method || 'GET'} ${url}`);
 		const response = await fetch(url, init);
-		console.log(`[GiteeAPI] response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
+		log.log(`response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
 		if (!response.ok) {
 			const text = await response.text().catch(() => '');
-			console.log(`[GiteeAPI] ERROR body: ${text.substring(0, 500)}`);
+			log.log(`ERROR body: ${text.substring(0, 500)}`);
 			throw new Error(`Gitee API ${response.status}: ${text}`);
 		}
 		if (response.status === 204) return undefined;
@@ -95,7 +98,7 @@ export class GiteeAPI {
 	 * endpoint supported by Gitee.
 	 */
 	async createBranch(newBranch: string, fromRef: string = 'master'): Promise<void> {
-		console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
+		log.log(`creating branch '${newBranch}' from '${fromRef}'`);
 		await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -104,7 +107,7 @@ export class GiteeAPI {
 				refs: fromRef,
 			}),
 		});
-		console.log(`[GiteeAPI] branch '${newBranch}' created`);
+		log.log(`branch '${newBranch}' created`);
 	}
 
 	// -----------------------------------------------------------------------
@@ -163,7 +166,7 @@ export class GiteeAPI {
 		} catch (err: any) {
 			const msg = err.message || '';
 			if (msg.includes('SHA does not match') || msg.includes('sha does not match') || msg.includes('Blob')) {
-				console.warn(`[GiteeAPI] SHA mismatch for ${path}, refreshing SHA and retrying...`);
+				log.warn(`SHA mismatch for ${path}, refreshing SHA and retrying...`);
 				const freshSha = await this.getFileSha(path);
 				if (freshSha) {
 					const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
@@ -199,7 +202,7 @@ export class GiteeAPI {
 		} catch (err: any) {
 			const msg = err.message || '';
 			if (msg.includes('SHA does not match') || msg.includes('sha does not match') || msg.includes('Blob')) {
-				console.warn(`[GiteeAPI] SHA mismatch for delete ${path}, refreshing SHA and retrying...`);
+				log.warn(`SHA mismatch for delete ${path}, refreshing SHA and retrying...`);
 				const freshSha = await this.getFileSha(path);
 				if (freshSha) {
 					await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
