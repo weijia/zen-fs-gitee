@@ -447,7 +447,7 @@ export class GiteeFS extends IndexFS {
 
 	// --- Write ---
 
-	async write(path: string, data: Uint8Array, offset: number): Promise<void> {
+	async write(path: string, data: Uint8Array, offset: number, mtimeMs?: number): Promise<void> {
 		let existing = this.contentCache.get(path) || new Uint8Array(0);
 		const newSize = Math.max(existing.length, offset + data.length);
 		const merged = new Uint8Array(newSize);
@@ -461,9 +461,15 @@ export class GiteeFS extends IndexFS {
 		this.contentCache.set(path, writeContent);
 		this._persistContent(path, writeContent);
 
+		// Preserve the source's real mtime (fall back to now). Without this the
+		// target mtime would be lost and stat() would fall back to the commit
+		// time, making the sync engine re-PUT content-identical files every
+		// cycle (see DESIGN.md §4).
+		const effectiveMtime = mtimeMs ?? Date.now();
+
 		const inode = this.index.get(path);
 		if (inode) {
-			inode.update({ mtimeMs: Date.now(), size: writeContent.length });
+			inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
 		}
 
 		const sha = this.shaCache.get(path);
@@ -476,9 +482,13 @@ export class GiteeFS extends IndexFS {
 			this.shaCache.set(path, newSha);
 			this._persistSha(path, newSha);
 		}
+
+		// Write the .mtime sidecar so cross-backend sync can compare the real
+		// modification time instead of the Gitee commit time.
+		await this.writeMtimeSidecar(path, effectiveMtime);
 	}
 
-	writeSync(path: string, data: Uint8Array, offset: number): void {
+	writeSync(path: string, data: Uint8Array, offset: number, mtimeMs?: number): void {
 		let existing = this.contentCache.get(path) || new Uint8Array(0);
 		const newSize = Math.max(existing.length, offset + data.length);
 		const merged = new Uint8Array(newSize);
@@ -492,9 +502,12 @@ export class GiteeFS extends IndexFS {
 		this.contentCache.set(path, writeContent);
 		this._persistContent(path, writeContent);
 
+		// Preserve the source's real mtime (fall back to now). See DESIGN.md §4.
+		const effectiveMtime = mtimeMs ?? Date.now();
+
 		const inode = this.index.get(path);
 		if (inode) {
-			inode.update({ mtimeMs: Date.now(), size: writeContent.length });
+			inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
 		}
 
 		const sha = this.shaCache.get(path);
@@ -509,6 +522,64 @@ export class GiteeFS extends IndexFS {
 				})
 				.catch(() => {})
 		);
+
+		// Write the .mtime sidecar (queued, fire-and-forget) — see DESIGN.md §4.
+		this.writeMtimeSidecarSync(path, effectiveMtime);
+	}
+
+	// --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
+
+	/** Write/update the `.mtime` sidecar for a file (async). */
+	private async writeMtimeSidecar(path: string, mtimeMs: number): Promise<void> {
+		const sidecarPath = mtimePathFor(path);
+		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+		const existingSidecarSha = this.shaCache.get(sidecarPath);
+		const newSha = existingSidecarSha
+			? await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+			: await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+		this.shaCache.set(sidecarPath, newSha);
+		this._persistSha(sidecarPath, newSha);
+		this.contentCache.set(sidecarPath, sidecarContent);
+		this._persistContent(sidecarPath, sidecarContent);
+	}
+
+	/** Write/update the `.mtime` sidecar for a file (sync, queued). */
+	private writeMtimeSidecarSync(path: string, mtimeMs: number): void {
+		const sidecarPath = mtimePathFor(path);
+		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+		const existingSidecarSha = this.shaCache.get(sidecarPath);
+		this._queue(
+			(existingSidecarSha
+				? this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+				: this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`)
+			)
+				.then((newSha) => {
+					this.shaCache.set(sidecarPath, newSha);
+					this._persistSha(sidecarPath, newSha);
+				})
+				.catch(() => {})
+		);
+		this.contentCache.set(sidecarPath, sidecarContent);
+		this._persistContent(sidecarPath, sidecarContent);
+	}
+
+	// --- WriteFile override (forward { mtime } into the sidecar) ---
+
+	/**
+	 * Override base `writeFile` so an optional `{ mtime }` option is forwarded
+	 * to `write()` and persisted in the `.mtime` sidecar. This is what makes
+	 * cross-backend mtime preservation actually take effect when the sync
+	 * engine writes through `writeFile({ mtime })` (e.g. via CachedFileSystem
+	 * + adapter), not only through `writeFileWithMtime`.
+	 */
+	async writeFile(path: string, data: string | Uint8Array, options?: any): Promise<void> {
+		const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+		await this.write(path, buf, 0, options?.mtime);
+	}
+
+	writeFileSync(path: string, data: string | Uint8Array, options?: any): void {
+		const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+		this.writeSync(path, buf, 0, options?.mtime);
 	}
 
 	// --- Sync ---

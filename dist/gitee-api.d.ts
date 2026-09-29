@@ -38,9 +38,16 @@ export declare class GiteeAPI {
     request(path: string, init?: RequestInit): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
     /**
-     * Get the latest commit SHA of a branch via the Git refs API (GET, supported).
+     * Get the latest commit SHA of a branch.
+     *
+     * NOTE: Gitee's Git Data API `GET /git/refs/heads/{branch}` is NOT reliably
+     * supported — it returns 404 even for branches that clearly exist (e.g.
+     * `git/trees/{branch}` resolves fine with HTTP 200). We therefore use the
+     * Branches API `GET /repos/{owner}/{repo}/branches/{branch}`, which is fully
+     * supported by Gitee and returns the branch's head commit SHA under
+     * `commit.sha`.
      */
-    getBranchSha(branch: string): Promise<string>;
+    getBranchSha(branch: string): Promise<string | null>;
     /**
      * Create a new branch from an existing branch.
      * Uses POST /repos/{owner}/{repo}/branches — the only branch-creation

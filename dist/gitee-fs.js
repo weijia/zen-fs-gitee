@@ -3,6 +3,8 @@ import { IndexFS, Index, Inode } from '@zenfs/core';
 import { S_IFDIR, S_IFREG } from '@zenfs/core/constants';
 import { IdbKVStore } from 'zen-fs-cache';
 import { GiteeAPI } from './gitee-api.js';
+import { createLogger } from '@richard432/localstorage-logger';
+const log = createLogger('GiteeFS');
 import { mtimePathFor, isMtimeSidecar, shaHash } from './utils.js';
 /**
  * A ZenFS backend for Gitee repositories.
@@ -99,7 +101,7 @@ export class GiteeFS extends IndexFS {
             this.mtimeCache.set(path, entry);
         }
         this.lastCommitSha = savedCommitSha ?? null;
-        console.log(`[GiteeFS] IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
+        log.log(`IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
     }
     /**
      * Initialize the file system by loading the repository tree.
@@ -125,7 +127,7 @@ export class GiteeFS extends IndexFS {
             const msg = err.message || '';
             // Branch not found — try to create it
             if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
-                console.log(`[GiteeFS] Branch '${this.options.branch}' not found, attempting to create...`);
+                log.log(`Branch '${this.options.branch}' not found, attempting to create...`);
                 await this.api.createBranch(this.options.branch || 'master', 'master');
                 // Retry loading tree
                 tree = await this.api.getTree(true);
@@ -386,7 +388,7 @@ export class GiteeFS extends IndexFS {
         }
     }
     // --- Write ---
-    async write(path, data, offset) {
+    async write(path, data, offset, mtimeMs) {
         let existing = this.contentCache.get(path) || new Uint8Array(0);
         const newSize = Math.max(existing.length, offset + data.length);
         const merged = new Uint8Array(newSize);
@@ -398,9 +400,14 @@ export class GiteeFS extends IndexFS {
             : merged;
         this.contentCache.set(path, writeContent);
         this._persistContent(path, writeContent);
+        // Preserve the source's real mtime (fall back to now). Without this the
+        // target mtime would be lost and stat() would fall back to the commit
+        // time, making the sync engine re-PUT content-identical files every
+        // cycle (see DESIGN.md §4).
+        const effectiveMtime = mtimeMs ?? Date.now();
         const inode = this.index.get(path);
         if (inode) {
-            inode.update({ mtimeMs: Date.now(), size: writeContent.length });
+            inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
         }
         const sha = this.shaCache.get(path);
         if (sha) {
@@ -413,8 +420,11 @@ export class GiteeFS extends IndexFS {
             this.shaCache.set(path, newSha);
             this._persistSha(path, newSha);
         }
+        // Write the .mtime sidecar so cross-backend sync can compare the real
+        // modification time instead of the Gitee commit time.
+        await this.writeMtimeSidecar(path, effectiveMtime);
     }
-    writeSync(path, data, offset) {
+    writeSync(path, data, offset, mtimeMs) {
         let existing = this.contentCache.get(path) || new Uint8Array(0);
         const newSize = Math.max(existing.length, offset + data.length);
         const merged = new Uint8Array(newSize);
@@ -426,9 +436,11 @@ export class GiteeFS extends IndexFS {
             : merged;
         this.contentCache.set(path, writeContent);
         this._persistContent(path, writeContent);
+        // Preserve the source's real mtime (fall back to now). See DESIGN.md §4.
+        const effectiveMtime = mtimeMs ?? Date.now();
         const inode = this.index.get(path);
         if (inode) {
-            inode.update({ mtimeMs: Date.now(), size: writeContent.length });
+            inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
         }
         const sha = this.shaCache.get(path);
         this._queue((sha
@@ -439,6 +451,54 @@ export class GiteeFS extends IndexFS {
             this._persistSha(path, newSha);
         })
             .catch(() => { }));
+        // Write the .mtime sidecar (queued, fire-and-forget) — see DESIGN.md §4.
+        this.writeMtimeSidecarSync(path, effectiveMtime);
+    }
+    // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
+    /** Write/update the `.mtime` sidecar for a file (async). */
+    async writeMtimeSidecar(path, mtimeMs) {
+        const sidecarPath = mtimePathFor(path);
+        const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+        const existingSidecarSha = this.shaCache.get(sidecarPath);
+        const newSha = existingSidecarSha
+            ? await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+            : await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+        this.shaCache.set(sidecarPath, newSha);
+        this._persistSha(sidecarPath, newSha);
+        this.contentCache.set(sidecarPath, sidecarContent);
+        this._persistContent(sidecarPath, sidecarContent);
+    }
+    /** Write/update the `.mtime` sidecar for a file (sync, queued). */
+    writeMtimeSidecarSync(path, mtimeMs) {
+        const sidecarPath = mtimePathFor(path);
+        const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+        const existingSidecarSha = this.shaCache.get(sidecarPath);
+        this._queue((existingSidecarSha
+            ? this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+            : this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`))
+            .then((newSha) => {
+            this.shaCache.set(sidecarPath, newSha);
+            this._persistSha(sidecarPath, newSha);
+        })
+            .catch(() => { }));
+        this.contentCache.set(sidecarPath, sidecarContent);
+        this._persistContent(sidecarPath, sidecarContent);
+    }
+    // --- WriteFile override (forward { mtime } into the sidecar) ---
+    /**
+     * Override base `writeFile` so an optional `{ mtime }` option is forwarded
+     * to `write()` and persisted in the `.mtime` sidecar. This is what makes
+     * cross-backend mtime preservation actually take effect when the sync
+     * engine writes through `writeFile({ mtime })` (e.g. via CachedFileSystem
+     * + adapter), not only through `writeFileWithMtime`.
+     */
+    async writeFile(path, data, options) {
+        const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        await this.write(path, buf, 0, options?.mtime);
+    }
+    writeFileSync(path, data, options) {
+        const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        this.writeSync(path, buf, 0, options?.mtime);
     }
     // --- Sync ---
     async sync() {
@@ -655,7 +715,7 @@ export class GiteeFS extends IndexFS {
             return snapshot;
         }
         catch (err) {
-            console.warn(`[GiteeFS] createSnapshot failed:`, err);
+            log.warn(`createSnapshot failed:`, err);
             return null;
         }
     }

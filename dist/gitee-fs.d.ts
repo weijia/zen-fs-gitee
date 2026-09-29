@@ -103,8 +103,21 @@ export declare class GiteeFS extends IndexFS {
     removeSync(path: string): void;
     read(path: string, buffer: Uint8Array, start: number, end: number): Promise<void>;
     readSync(path: string, buffer: Uint8Array, start: number, end: number): void;
-    write(path: string, data: Uint8Array, offset: number): Promise<void>;
-    writeSync(path: string, data: Uint8Array, offset: number): void;
+    write(path: string, data: Uint8Array, offset: number, mtimeMs?: number): Promise<void>;
+    writeSync(path: string, data: Uint8Array, offset: number, mtimeMs?: number): void;
+    /** Write/update the `.mtime` sidecar for a file (async). */
+    private writeMtimeSidecar;
+    /** Write/update the `.mtime` sidecar for a file (sync, queued). */
+    private writeMtimeSidecarSync;
+    /**
+     * Override base `writeFile` so an optional `{ mtime }` option is forwarded
+     * to `write()` and persisted in the `.mtime` sidecar. This is what makes
+     * cross-backend mtime preservation actually take effect when the sync
+     * engine writes through `writeFile({ mtime })` (e.g. via CachedFileSystem
+     * + adapter), not only through `writeFileWithMtime`.
+     */
+    writeFile(path: string, data: string | Uint8Array, options?: any): Promise<void>;
+    writeFileSync(path: string, data: string | Uint8Array, options?: any): void;
     sync(): Promise<void>;
     syncSync(): void;
     /**

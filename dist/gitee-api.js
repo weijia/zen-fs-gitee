@@ -1,4 +1,6 @@
 import { apiPath, encodeBase64 } from './utils.js';
+import { createLogger } from '@richard432/localstorage-logger';
+const log = createLogger('GiteeAPI');
 /**
  * Gitee API v5 wrapper.
  *
@@ -26,12 +28,12 @@ export class GiteeAPI {
     async request(path, init) {
         const separator = path.includes('?') ? '&' : '?';
         const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
-        console.log(`[GiteeAPI] request: ${init?.method || 'GET'} ${url}`);
+        log.log(`request: ${init?.method || 'GET'} ${url}`);
         const response = await fetch(url, init);
-        console.log(`[GiteeAPI] response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
+        log.log(`response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
         if (!response.ok) {
             const text = await response.text().catch(() => '');
-            console.log(`[GiteeAPI] ERROR body: ${text.substring(0, 500)}`);
+            log.log(`ERROR body: ${text.substring(0, 500)}`);
             throw new Error(`Gitee API ${response.status}: ${text}`);
         }
         if (response.status === 204)
@@ -50,11 +52,18 @@ export class GiteeAPI {
         return data.tree || [];
     }
     /**
-     * Get the latest commit SHA of a branch via the Git refs API (GET, supported).
+     * Get the latest commit SHA of a branch.
+     *
+     * NOTE: Gitee's Git Data API `GET /git/refs/heads/{branch}` is NOT reliably
+     * supported — it returns 404 even for branches that clearly exist (e.g.
+     * `git/trees/{branch}` resolves fine with HTTP 200). We therefore use the
+     * Branches API `GET /repos/{owner}/{repo}/branches/{branch}`, which is fully
+     * supported by Gitee and returns the branch's head commit SHA under
+     * `commit.sha`.
      */
     async getBranchSha(branch) {
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${branch}`);
-        return data.object?.sha;
+        const data = await this.request(`/repos/${this.owner}/${this.repo}/branches/${branch}`);
+        return data?.commit?.sha ?? null;
     }
     // -----------------------------------------------------------------------
     // Branch creation (POST /branches, supported by Gitee)
@@ -65,7 +74,7 @@ export class GiteeAPI {
      * endpoint supported by Gitee.
      */
     async createBranch(newBranch, fromRef = 'master') {
-        console.log(`[GiteeAPI] creating branch '${newBranch}' from '${fromRef}'`);
+        log.log(`creating branch '${newBranch}' from '${fromRef}'`);
         await this.request(`/repos/${this.owner}/${this.repo}/branches`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -74,7 +83,7 @@ export class GiteeAPI {
                 refs: fromRef,
             }),
         });
-        console.log(`[GiteeAPI] branch '${newBranch}' created`);
+        log.log(`branch '${newBranch}' created`);
     }
     // -----------------------------------------------------------------------
     // Contents API (GET / POST / PUT / DELETE — all supported by Gitee)
@@ -129,7 +138,7 @@ export class GiteeAPI {
         catch (err) {
             const msg = err.message || '';
             if (msg.includes('SHA does not match') || msg.includes('sha does not match') || msg.includes('Blob')) {
-                console.warn(`[GiteeAPI] SHA mismatch for ${path}, refreshing SHA and retrying...`);
+                log.warn(`SHA mismatch for ${path}, refreshing SHA and retrying...`);
                 const freshSha = await this.getFileSha(path);
                 if (freshSha) {
                     const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
@@ -165,7 +174,7 @@ export class GiteeAPI {
         catch (err) {
             const msg = err.message || '';
             if (msg.includes('SHA does not match') || msg.includes('sha does not match') || msg.includes('Blob')) {
-                console.warn(`[GiteeAPI] SHA mismatch for delete ${path}, refreshing SHA and retrying...`);
+                log.warn(`SHA mismatch for delete ${path}, refreshing SHA and retrying...`);
                 const freshSha = await this.getFileSha(path);
                 if (freshSha) {
                     await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
