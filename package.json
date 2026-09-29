@@ -1,18 +1,16 @@
 {
   "name": "zen-fs-gitee",
-  "version": "1.2.13",
+  "version": "1.2.14",
   "description": "A ZenFS backend for Gitee repositories",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "browser": "./dist/zen-fs-gitee.global.js",
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
-  "browser": "./dist/zen-fs-gitee.global.js",
   "files": [
     "dist",
     "license.md",
