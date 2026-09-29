@@ -84,3 +84,8 @@ is always persisted and `stat()` returns the real mtime.
 
 See also `zen-fs-config/DESIGN.md` §13 "Mtime Preservation During Sync" and
 its backend status table.
+
+> **Status**: Implemented in `zen-fs-gitee@1.2.17`. `write()` / `writeSync()`
+> now persist the `.mtime` sidecar, and `writeFile` / `writeFileSync` forward
+> `options.mtime` into the sidecar — so the real mtime survives cross-backend
+> sync and the "no-diff" re-PUTs no longer occur.
