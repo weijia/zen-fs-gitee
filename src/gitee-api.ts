@@ -81,11 +81,18 @@ export class GiteeAPI {
 	}
 
 	/**
-	 * Get the latest commit SHA of a branch via the Git refs API (GET, supported).
+	 * Get the latest commit SHA of a branch.
+	 *
+	 * NOTE: Gitee's Git Data API `GET /git/refs/heads/{branch}` is NOT reliably
+	 * supported — it returns 404 even for branches that clearly exist (e.g.
+	 * `git/trees/{branch}` resolves fine with HTTP 200). We therefore use the
+	 * Branches API `GET /repos/{owner}/{repo}/branches/{branch}`, which is fully
+	 * supported by Gitee and returns the branch's head commit SHA under
+	 * `commit.sha`.
 	 */
-	async getBranchSha(branch: string): Promise<string> {
-		const data = await this.request(`/repos/${this.owner}/${this.repo}/git/refs/heads/${branch}`);
-		return data.object?.sha;
+	async getBranchSha(branch: string): Promise<string | null> {
+		const data = await this.request(`/repos/${this.owner}/${this.repo}/branches/${branch}`);
+		return data?.commit?.sha ?? null;
 	}
 
 	// -----------------------------------------------------------------------
