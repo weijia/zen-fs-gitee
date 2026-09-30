@@ -6,6 +6,8 @@ import { GiteeAPI } from './gitee-api.js';
 import { createLogger } from '@richard432/localstorage-logger';
 const log = createLogger('GiteeFS');
 import { mtimePathFor, sidecarToDataPath, shaHash } from './utils.js';
+/** TTL (ms) for the negative cache of "path has no .mtime sidecar" — avoids 404 storms. */
+const NO_SIDECAR_TTL_MS = 10 * 60 * 1000;
 /**
  * A ZenFS backend for Gitee repositories.
  *
@@ -18,8 +20,10 @@ export class GiteeFS extends IndexFS {
     shaCache = new Map();
     /** In-memory content cache to support synchronous reads. */
     contentCache = new Map();
-    /** Cached file mtime entries: path -> { sha, lastModified }. Populated lazily via Commits API. */
+    /** Cached file mtime entries: path -> { sha, lastModified, fromSidecar }. */
     mtimeCache = new Map();
+    /** Paths confirmed (via 404) to have NO .mtime sidecar; value = timestamp. Avoids repeated 404s. */
+    noSidecarCache = new Map();
     /** Serializes async background operations. */
     pending = Promise.resolve();
     options;
@@ -98,7 +102,14 @@ export class GiteeFS extends IndexFS {
             this.contentCache.set(path, data);
         }
         for (const [path, entry] of mtimeEntries) {
-            this.mtimeCache.set(path, entry);
+            // Old cached entries may lack fromSidecar; default to false so a real
+            // sidecar is re-detected on the next stat() instead of being trusted
+            // as a stale commit-time mtime forever.
+            this.mtimeCache.set(path, {
+                sha: entry.sha,
+                lastModified: entry.lastModified,
+                fromSidecar: entry.fromSidecar ?? false,
+            });
         }
         this.lastCommitSha = savedCommitSha ?? null;
         log.log(`IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? 'none'}`);
@@ -461,6 +472,11 @@ export class GiteeFS extends IndexFS {
     // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
     /** Write/update the `.mtime` sidecar for a file (async). */
     async writeMtimeSidecar(path, mtimeMs) {
+        // Never nest sidecars: if `path` is itself a .mtime sidecar, do nothing
+        // (otherwise we'd create `.file.mtime.mtime`). This happens when a sidecar
+        // file is legitimately synced as a regular file to another backend.
+        if (sidecarToDataPath(path) !== null)
+            return;
         const sidecarPath = mtimePathFor(path);
         const sidecarContent = new TextEncoder().encode(String(mtimeMs));
         const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -471,9 +487,23 @@ export class GiteeFS extends IndexFS {
         this._persistSha(sidecarPath, newSha);
         this.contentCache.set(sidecarPath, sidecarContent);
         this._persistContent(sidecarPath, sidecarContent);
+        // Refresh the *data file's* mtime cache so the next stat() immediately
+        // sees the real mtime instead of an ever-changing commit time (which
+        // re-triggers MTIME NORMALIZE). writeMtimeSidecar() bypasses the index,
+        // so the local caches must be refreshed here.
+        this.noSidecarCache.delete(path);
+        const dataSha = this.shaCache.get(path);
+        if (dataSha) {
+            const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+            this.mtimeCache.set(path, entry);
+            this._persistMtime(path, entry);
+        }
     }
     /** Write/update the `.mtime` sidecar for a file (sync, queued). */
     writeMtimeSidecarSync(path, mtimeMs) {
+        // Never nest sidecars — see writeMtimeSidecar().
+        if (sidecarToDataPath(path) !== null)
+            return;
         const sidecarPath = mtimePathFor(path);
         const sidecarContent = new TextEncoder().encode(String(mtimeMs));
         const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -487,6 +517,17 @@ export class GiteeFS extends IndexFS {
             .catch(() => { }));
         this.contentCache.set(sidecarPath, sidecarContent);
         this._persistContent(sidecarPath, sidecarContent);
+        // Refresh the *data file's* mtime cache so the next stat() immediately
+        // sees the real mtime (see writeMtimeSidecar()). Done synchronously here
+        // (not inside the queued promise) so it takes effect without waiting for
+        // the sidecar write to flush.
+        this.noSidecarCache.delete(path);
+        const dataSha = this.shaCache.get(path);
+        if (dataSha) {
+            const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+            this.mtimeCache.set(path, entry);
+            this._persistMtime(path, entry);
+        }
     }
     // --- WriteFile override (forward { mtime } into the sidecar) ---
     /**
@@ -533,25 +574,44 @@ export class GiteeFS extends IndexFS {
             return inode;
         const currentSha = this.shaCache.get(path);
         const cached = this.mtimeCache.get(path);
-        // 1. If cached SHA matches current SHA, use cached mtime (no API calls)
-        if (cached && cached.sha === currentSha && cached.lastModified) {
-            inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
-            return inode;
+        // 1. Cached mtime. Trust it ONLY when it came from the .mtime sidecar
+        //    (exact, stable), or when we have *also* confirmed (via 404) that no
+        //    sidecar exists for this path within the negative-cache window.
+        //    A cached commit-time value without that confirmation is NOT trusted:
+        //    writeFileWithMtime() writes the sidecar via the raw API and bypasses
+        //    the local index, so the sidecar may exist on the server even though
+        //    this stat() can't see it. Trusting a stale commit time here is what
+        //    caused the endless MTIME NORMALIZE loop (target mtime changed every
+        //    sync → source/target never agreed → re-PUT the same content).
+        if (cached && cached.sha === currentSha) {
+            if (cached.fromSidecar) {
+                inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
+                return inode;
+            }
+            const neg = this.noSidecarCache.get(path);
+            if (neg !== undefined && Date.now() - neg <= NO_SIDECAR_TTL_MS) {
+                inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
+                return inode;
+            }
+            // fromSidecar=false and no fresh negative entry → fall through to
+            // re-check the sidecar (it may have been written in the meantime).
         }
-        // SHA changed or no cache — need to fetch mtime.
-        // 2. Try reading mtime from sidecar file first (most precise)
         const sidecarPath = mtimePathFor(path);
-        // Only attempt to read the sidecar if it exists in shaCache (i.e.,
-        // it was present in the Git tree). This avoids unnecessary 404 API
-        // calls for files that have never been written with writeFileWithMtime.
-        if (this.shaCache.has(sidecarPath) || this.contentCache.has(sidecarPath)) {
+        // 2. Try the .mtime sidecar first (authoritative, preserves the source's
+        //    real modification time). Do NOT gate on shaCache.has(sidecarPath):
+        //    writeFileWithMtime() bypasses the local index, so the sidecar SHA is
+        //    often unknown locally even though the file exists on the server.
+        //    Always attempt to read it; a confirmed-missing sidecar (404) is
+        //    remembered in noSidecarCache to avoid a 404 storm, but with a short
+        //    TTL so a sidecar written later is still picked up.
+        const neg = this.noSidecarCache.get(path);
+        if (neg === undefined || Date.now() - neg > NO_SIDECAR_TTL_MS) {
             try {
                 const sidecarData = this.contentCache.get(sidecarPath)
                     || (await this.api.getRaw(sidecarPath));
                 const sidecarBytes = sidecarData instanceof Uint8Array
                     ? sidecarData
                     : new Uint8Array(sidecarData);
-                // Persist sidecar content if it was fetched from API
                 if (!this.contentCache.has(sidecarPath)) {
                     this.contentCache.set(sidecarPath, sidecarBytes);
                     this._persistContent(sidecarPath, sidecarBytes);
@@ -560,24 +620,28 @@ export class GiteeFS extends IndexFS {
                 const mtimeMs = Number(mtimeStr);
                 if (!isNaN(mtimeMs) && mtimeMs > 0) {
                     inode.update({ mtimeMs });
-                    // Cache in mtimeCache so subsequent calls don't re-read sidecar
                     if (currentSha) {
-                        const mtimeEntry = { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() };
+                        const mtimeEntry = { sha: currentSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
                         this.mtimeCache.set(path, mtimeEntry);
                         this._persistMtime(path, mtimeEntry);
                     }
                     return inode;
                 }
+                // Sidecar present but unparsable → fall through to Commits API.
             }
             catch {
-                // Sidecar exists in cache but raw fetch failed — fall through to Commits API
+                // 404 / network error — no sidecar (yet). Remember it briefly.
+                this.noSidecarCache.set(path, Date.now());
             }
         }
-        // 3. Fall back to Commits API for files without sidecar
+        // 3. Fall back to Commits API (imprecise: commit time varies per sync).
+        //    Cache it with fromSidecar=false so step 1 won't trust it across
+        //    cycles without a confirming negative entry, allowing re-detection
+        //    of a sidecar that appears later.
         if (currentSha) {
             const commit = await this.api.getLastCommit(path);
             if (commit) {
-                const mtimeEntry = { sha: currentSha, lastModified: commit.date };
+                const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
                 this.mtimeCache.set(path, mtimeEntry);
                 this._persistMtime(path, mtimeEntry);
                 inode.update({ mtimeMs: new Date(commit.date).getTime() });

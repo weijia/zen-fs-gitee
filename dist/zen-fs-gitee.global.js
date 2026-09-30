@@ -18857,14 +18857,17 @@ var ZenFSGitee = (() => {
 
   // src/gitee-fs.ts
   var log3 = createLogger("GiteeFS");
+  var NO_SIDECAR_TTL_MS = 10 * 60 * 1e3;
   var GiteeFS = class extends IndexFS {
     api;
     /** Maps file paths to their blob SHA (needed for updates/deletes). */
     shaCache = /* @__PURE__ */ new Map();
     /** In-memory content cache to support synchronous reads. */
     contentCache = /* @__PURE__ */ new Map();
-    /** Cached file mtime entries: path -> { sha, lastModified }. Populated lazily via Commits API. */
+    /** Cached file mtime entries: path -> { sha, lastModified, fromSidecar }. */
     mtimeCache = /* @__PURE__ */ new Map();
+    /** Paths confirmed (via 404) to have NO .mtime sidecar; value = timestamp. Avoids repeated 404s. */
+    noSidecarCache = /* @__PURE__ */ new Map();
     /** Serializes async background operations. */
     pending = Promise.resolve();
     options;
@@ -18949,7 +18952,11 @@ var ZenFSGitee = (() => {
         this.contentCache.set(path, data);
       }
       for (const [path, entry] of mtimeEntries) {
-        this.mtimeCache.set(path, entry);
+        this.mtimeCache.set(path, {
+          sha: entry.sha,
+          lastModified: entry.lastModified,
+          fromSidecar: entry.fromSidecar ?? false
+        });
       }
       this.lastCommitSha = savedCommitSha ?? null;
       log3.log(`IDB restore: ${shaEntries.length} SHAs, ${contentEntries.length} contents, ${mtimeEntries.length} mtime entries, commitSha=${this.lastCommitSha?.slice(0, 7) ?? "none"}`);
@@ -19257,6 +19264,7 @@ var ZenFSGitee = (() => {
     // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
     /** Write/update the `.mtime` sidecar for a file (async). */
     async writeMtimeSidecar(path, mtimeMs) {
+      if (sidecarToDataPath(path) !== null) return;
       const sidecarPath = mtimePathFor(path);
       const sidecarContent = new TextEncoder().encode(String(mtimeMs));
       const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -19265,9 +19273,17 @@ var ZenFSGitee = (() => {
       this._persistSha(sidecarPath, newSha);
       this.contentCache.set(sidecarPath, sidecarContent);
       this._persistContent(sidecarPath, sidecarContent);
+      this.noSidecarCache.delete(path);
+      const dataSha = this.shaCache.get(path);
+      if (dataSha) {
+        const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+        this.mtimeCache.set(path, entry);
+        this._persistMtime(path, entry);
+      }
     }
     /** Write/update the `.mtime` sidecar for a file (sync, queued). */
     writeMtimeSidecarSync(path, mtimeMs) {
+      if (sidecarToDataPath(path) !== null) return;
       const sidecarPath = mtimePathFor(path);
       const sidecarContent = new TextEncoder().encode(String(mtimeMs));
       const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -19280,6 +19296,13 @@ var ZenFSGitee = (() => {
       );
       this.contentCache.set(sidecarPath, sidecarContent);
       this._persistContent(sidecarPath, sidecarContent);
+      this.noSidecarCache.delete(path);
+      const dataSha = this.shaCache.get(path);
+      if (dataSha) {
+        const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+        this.mtimeCache.set(path, entry);
+        this._persistMtime(path, entry);
+      }
     }
     // --- WriteFile override (forward { mtime } into the sidecar) ---
     /**
@@ -19323,12 +19346,20 @@ var ZenFSGitee = (() => {
       if ((inode.mode & S_IFREG) !== S_IFREG) return inode;
       const currentSha = this.shaCache.get(path);
       const cached = this.mtimeCache.get(path);
-      if (cached && cached.sha === currentSha && cached.lastModified) {
-        inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
-        return inode;
+      if (cached && cached.sha === currentSha) {
+        if (cached.fromSidecar) {
+          inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
+          return inode;
+        }
+        const neg2 = this.noSidecarCache.get(path);
+        if (neg2 !== void 0 && Date.now() - neg2 <= NO_SIDECAR_TTL_MS) {
+          inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
+          return inode;
+        }
       }
       const sidecarPath = mtimePathFor(path);
-      if (this.shaCache.has(sidecarPath) || this.contentCache.has(sidecarPath)) {
+      const neg = this.noSidecarCache.get(path);
+      if (neg === void 0 || Date.now() - neg > NO_SIDECAR_TTL_MS) {
         try {
           const sidecarData = this.contentCache.get(sidecarPath) || await this.api.getRaw(sidecarPath);
           const sidecarBytes = sidecarData instanceof Uint8Array ? sidecarData : new Uint8Array(sidecarData);
@@ -19341,19 +19372,20 @@ var ZenFSGitee = (() => {
           if (!isNaN(mtimeMs) && mtimeMs > 0) {
             inode.update({ mtimeMs });
             if (currentSha) {
-              const mtimeEntry = { sha: currentSha, lastModified: new Date(mtimeMs).toISOString() };
+              const mtimeEntry = { sha: currentSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
               this.mtimeCache.set(path, mtimeEntry);
               this._persistMtime(path, mtimeEntry);
             }
             return inode;
           }
         } catch {
+          this.noSidecarCache.set(path, Date.now());
         }
       }
       if (currentSha) {
         const commit = await this.api.getLastCommit(path);
         if (commit) {
-          const mtimeEntry = { sha: currentSha, lastModified: commit.date };
+          const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
           this.mtimeCache.set(path, mtimeEntry);
           this._persistMtime(path, mtimeEntry);
           inode.update({ mtimeMs: new Date(commit.date).getTime() });

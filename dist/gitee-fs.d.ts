@@ -30,11 +30,14 @@ export declare class GiteeFS extends IndexFS {
     readonly shaCache: Map<string, string>;
     /** In-memory content cache to support synchronous reads. */
     readonly contentCache: Map<string, Uint8Array<ArrayBufferLike>>;
-    /** Cached file mtime entries: path -> { sha, lastModified }. Populated lazily via Commits API. */
+    /** Cached file mtime entries: path -> { sha, lastModified, fromSidecar }. */
     readonly mtimeCache: Map<string, {
         sha: string;
         lastModified: string;
+        fromSidecar: boolean;
     }>;
+    /** Paths confirmed (via 404) to have NO .mtime sidecar; value = timestamp. Avoids repeated 404s. */
+    private readonly noSidecarCache;
     /** Serializes async background operations. */
     private pending;
     private options;
