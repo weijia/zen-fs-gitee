@@ -289,12 +289,14 @@ describe('GiteeAPI', () => {
 			ok: true,
 			status: 200,
 			headers: new Headers({ 'content-type': 'application/json' }),
-			json: async () => ({ object: { sha: 'abc123' } }),
+			json: async () => ({ commit: { sha: 'abc123' } }),
 			text: async () => '', arrayBuffer: async () => new ArrayBuffer(0),
 		} as Response);
 
 		const sha = await api.getLatestCommitSha();
 		expect(sha).toBe('abc123');
+		// NOTE: getLatestCommitSha -> getBranchSha reads data.commit.sha,
+		// so the mock must shape { commit: { sha } }, not { object: { sha } }.
 	});
 
 	it('getLatestCommitSha returns null on error', async () => {

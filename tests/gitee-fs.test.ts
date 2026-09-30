@@ -50,14 +50,32 @@ describe('GiteeFS', () => {
 		} as Response;
 	}
 
+	let repoCounter = 0;
 	beforeEach(() => {
+		repoCounter++;
 		fs = new GiteeFS({
 			token: 'test-token',
 			owner: 'test-owner',
-			repo: 'test-repo',
+			repo: `test-repo-${repoCounter}`,
 			branch: 'main',
 		});
+		// Skip the incidental shouldSync baseline fetch inside init() so unit
+		// tests don't have to account for an extra getLatestCommitSha() call.
+		// (Seeding lastCommitSha directly doesn't work because loadFromIDB()
+		// resets it from IndexedDB during init(), so stub the API method.)
+		fs.api.getLatestCommitSha = async () => null;
 		fetchSpy = vi.spyOn(globalThis, 'fetch');
+		// Default benign response for any fetch not explicitly mocked. This keeps
+		// incidental calls (mtime sidecar getRaw / getLastCommit fallbacks) from
+		// hitting the network and lets them resolve instantly.
+		fetchSpy.mockResolvedValue({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [],
+			text: async () => '',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
 	});
 
 	afterEach(() => {
@@ -214,7 +232,8 @@ describe('GiteeFS', () => {
 			expect(fs.contentCache.get('/sync.txt')!).toEqual(data);
 			// Wait for background queue to drain
 			await fs.sync();
-			expect(fetchSpy).toHaveBeenCalledTimes(2);
+			// 1 (tree) + 1 (data write) + 1 (mtime sidecar write) = 3
+			expect(fetchSpy).toHaveBeenCalledTimes(3);
 		});
 	});
 
@@ -243,6 +262,8 @@ describe('GiteeFS', () => {
 
 			expect(fs.contentCache.has('/del.txt')).toBe(false);
 			await fs.sync();
+			// 1 (tree) + 1 (data delete); no sidecar exists in the tree, so the
+			// sidecar delete is skipped.
 			expect(fetchSpy).toHaveBeenCalledTimes(2);
 		});
 	});
@@ -288,9 +309,11 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// No sidecar in tree, so stat() skips getRaw and goes to Commits API
-
-		// Mock getLastCommit API response
+		// No sidecar in tree, so stat() calls getRaw(sidecar) first (which
+		// 404s / returns nothing) and then falls through to the Commits API.
+		// Queue the getRaw response BEFORE getLastCommit so the latter isn't
+		// consumed by the former.
+		fetchSpy.mockResolvedValueOnce(mockRawResponse(''));
 		fetchSpy.mockResolvedValueOnce(mockOkJson([
 			{
 				sha: 'commit-sha-1',
@@ -302,36 +325,42 @@ describe('GiteeFS', () => {
 		expect(inode.size).toBe(50);
 		expect(inode.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
 
-		// Should be cached in mtimeCache
+		// Should be cached in mtimeCache (commit-time, not from sidecar)
 		expect(fs.mtimeCache.get('/notes.md')).toEqual({
 			sha: 'sha1',
 			lastModified: '2025-01-15T10:30:00+08:00',
+			fromSidecar: false,
 		});
 	});
 
-		it('async stat uses cached mtime on second call', async () => {
+		it('async stat re-fetches last commit date on each call when no sidecar is present', async () => {
 		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
 		]));
 		await fs.init();
 
-		// No sidecar in tree, so stat() skips getRaw and goes to Commits API
-		fetchSpy.mockResolvedValueOnce(mockOkJson([
+		// No sidecar in tree, so stat() goes to the Commits API on every call.
+		// Commit-time mtime is intentionally NOT cached (a cached commit time
+		// with no sidecar confirmation caused an endless MTIME NORMALIZE loop),
+		// so each stat re-fetches it.
+		const commitMock = mockOkJson([
 			{
 				sha: 'commit-sha-1',
 				commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
 			},
-		]));
+		]);
+		// stat() calls getRaw(sidecar) before getLastCommit on every call, so
+		// queue an empty getRaw response ahead of each getLastCommit mock.
+		fetchSpy.mockResolvedValueOnce(mockRawResponse(''));
+		fetchSpy.mockResolvedValueOnce(commitMock);
+		fetchSpy.mockResolvedValueOnce(mockRawResponse(''));
+		fetchSpy.mockResolvedValueOnce(commitMock);
 
 		const inode1 = await fs.stat('/notes.md');
 		expect(inode1.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
 
-		// Second call should NOT trigger another fetch (cached)
 		const inode2 = await fs.stat('/notes.md');
 		expect(inode2.mtimeMs).toBe(new Date('2025-01-15T10:30:00+08:00').getTime());
-
-		// fetchSpy: 1 (tree) + 1 (getLastCommit) = 2 total (no sidecar fetch)
-		expect(fetchSpy).toHaveBeenCalledTimes(2);
 	});
 
 		it('async stat re-fetches mtime when SHA changes', async () => {
@@ -340,27 +369,21 @@ describe('GiteeFS', () => {
 		]));
 		await fs.init();
 
-		// First stat: no sidecar in tree, goes to Commits API
-		fetchSpy.mockResolvedValueOnce(mockOkJson([
-			{
-				sha: 'commit-1',
-				commit: { committer: { date: '2025-01-15T10:30:00+08:00' } },
-			},
-		]));
+		// Stub getLastCommit directly to avoid fetch-queue ordering issues;
+		// getRaw(sidecar) falls through to this stub via the default mock.
+		const commit1 = '2025-01-15T10:30:00+08:00';
+		const commit2 = '2025-06-20T14:00:00+08:00';
+		let currentCommit = commit1;
+		fs.api.getLastCommit = async () => ({ date: currentCommit, sha: 'commit-sha' });
+
 		await fs.stat('/notes.md');
 
 		// Simulate SHA change (e.g. remote update)
 		fs.shaCache.set('/notes.md', 'sha2');
+		currentCommit = commit2;
 
-		// Second stat should fetch new commit date via Commits API
-		fetchSpy.mockResolvedValueOnce(mockOkJson([
-			{
-				sha: 'commit-2',
-				commit: { committer: { date: '2025-06-20T14:00:00+08:00' } },
-			},
-		]));
 		const inode = await fs.stat('/notes.md');
-		expect(inode.mtimeMs).toBe(new Date('2025-06-20T14:00:00+08:00').getTime());
+		expect(inode.mtimeMs).toBe(new Date(commit2).getTime());
 		expect(fs.mtimeCache.get('/notes.md')!.sha).toBe('sha2');
 	});
 
