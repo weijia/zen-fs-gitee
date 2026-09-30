@@ -19264,7 +19264,10 @@ var ZenFSGitee = (() => {
     // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
     /** Write/update the `.mtime` sidecar for a file (async). */
     async writeMtimeSidecar(path, mtimeMs) {
-      if (sidecarToDataPath(path) !== null) return;
+      if (sidecarToDataPath(path) !== null) {
+        log3.warn(`refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar) \u2014 would create .mtime.mtime`);
+        return;
+      }
       const sidecarPath = mtimePathFor(path);
       const sidecarContent = new TextEncoder().encode(String(mtimeMs));
       const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -19283,7 +19286,10 @@ var ZenFSGitee = (() => {
     }
     /** Write/update the `.mtime` sidecar for a file (sync, queued). */
     writeMtimeSidecarSync(path, mtimeMs) {
-      if (sidecarToDataPath(path) !== null) return;
+      if (sidecarToDataPath(path) !== null) {
+        log3.warn(`refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar) \u2014 would create .mtime.mtime`);
+        return;
+      }
       const sidecarPath = mtimePathFor(path);
       const sidecarContent = new TextEncoder().encode(String(mtimeMs));
       const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -19487,7 +19493,12 @@ var ZenFSGitee = (() => {
         }
         for (const item of tree) {
           if (item.type === "tree") continue;
-          if (sidecarToDataPath(item.path)) continue;
+          if (sidecarToDataPath(item.path)) {
+            if (item.path.endsWith(".mtime.mtime")) {
+              log3.warn(`createSnapshot: skipping nested mtime sidecar (won't sync): /${item.path}`);
+            }
+            continue;
+          }
           const fullPath = "/" + item.path;
           const normalizedRoot = root === "/" ? "" : root;
           if (normalizedRoot && !fullPath.startsWith(normalizedRoot + "/")) {

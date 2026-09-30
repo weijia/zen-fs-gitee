@@ -475,8 +475,13 @@ export class GiteeFS extends IndexFS {
         // Never nest sidecars: if `path` is itself a .mtime sidecar, do nothing
         // (otherwise we'd create `.file.mtime.mtime`). This happens when a sidecar
         // file is legitimately synced as a regular file to another backend.
-        if (sidecarToDataPath(path) !== null)
+        if (sidecarToDataPath(path) !== null) {
+            // Path is already a `.mtime` sidecar — never nest it into
+            // `.mtime.mtime`. Warn so the caller (a sync engine replicating a
+            // sidecar as a regular file) can be identified and fixed.
+            log.warn(`refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar) — would create .mtime.mtime`);
             return;
+        }
         const sidecarPath = mtimePathFor(path);
         const sidecarContent = new TextEncoder().encode(String(mtimeMs));
         const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -502,8 +507,13 @@ export class GiteeFS extends IndexFS {
     /** Write/update the `.mtime` sidecar for a file (sync, queued). */
     writeMtimeSidecarSync(path, mtimeMs) {
         // Never nest sidecars — see writeMtimeSidecar().
-        if (sidecarToDataPath(path) !== null)
+        if (sidecarToDataPath(path) !== null) {
+            // Path is already a `.mtime` sidecar — never nest it into
+            // `.mtime.mtime`. Warn so the caller (a sync engine replicating a
+            // sidecar as a regular file) can be identified and fixed.
+            log.warn(`refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar) — would create .mtime.mtime`);
             return;
+        }
         const sidecarPath = mtimePathFor(path);
         const sidecarContent = new TextEncoder().encode(String(mtimeMs));
         const existingSidecarSha = this.shaCache.get(sidecarPath);
@@ -768,8 +778,14 @@ export class GiteeFS extends IndexFS {
                     continue;
                 // Skip mtime sidecar files (internal metadata) — also excludes
                 // them from appearing as user-visible files.
-                if (sidecarToDataPath(item.path))
+                if (sidecarToDataPath(item.path)) {
+                    // A nested sidecar (`*.mtime.mtime`) is a pathological artifact
+                    // that must never be synced; warn so it can be cleaned up.
+                    if (item.path.endsWith('.mtime.mtime')) {
+                        log.warn(`createSnapshot: skipping nested mtime sidecar (won't sync): /${item.path}`);
+                    }
                     continue;
+                }
                 const fullPath = '/' + item.path;
                 // Apply root filter: only include files under the specified root
                 const normalizedRoot = root === '/' ? '' : root;
