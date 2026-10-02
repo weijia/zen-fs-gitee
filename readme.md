@@ -115,6 +115,15 @@ pair.watch();
 - Hard links and symbolic links are not supported (`ENOSYS`).
 - The `writeFileSync` and `removeSync` methods update the local cache immediately and trigger background API calls.
 
+## Documentation
+
+开发文档（需求 / 用例 / 设计 / 测试用例）见 [`docs/`](./docs)：
+
+- [需求文档](./docs/requirements.md)
+- [用例文档](./docs/use-cases.md)
+- [设计文档](./docs/design.md)
+- [测试用例文档](./docs/testcases.md)
+
 ## License
 
 MIT
