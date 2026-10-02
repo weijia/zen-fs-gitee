@@ -2,6 +2,27 @@ import { apiPath, encodeBase64 } from './utils.js';
 import { createLogger } from '@richard432/localstorage-logger';
 const log = createLogger('GiteeAPI');
 /**
+ * Verbose (request/response) API tracing. Hidden by default to avoid console
+ * spam — enable with: localStorage.setItem('debug:verbose:GiteeAPI', '1')
+ */
+const VERBOSE_KEY = 'debug:verbose:GiteeAPI';
+try {
+    if (localStorage.getItem(VERBOSE_KEY) === null)
+        localStorage.setItem(VERBOSE_KEY, '0');
+}
+catch {
+    /* localStorage unavailable (Node.js) — stays hidden */
+}
+function verboseLog(...args) {
+    try {
+        if (localStorage.getItem(VERBOSE_KEY) === '1')
+            console.log('[GiteeAPI]', ...args);
+    }
+    catch {
+        /* ignore */
+    }
+}
+/**
  * Gitee API v5 wrapper.
  *
  * Only the Contents API (POST/PUT/DELETE /repos/{owner}/{repo}/contents/{path})
@@ -28,9 +49,9 @@ export class GiteeAPI {
     async request(path, init) {
         const separator = path.includes('?') ? '&' : '?';
         const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
-        log.log(`request: ${init?.method || 'GET'} ${url}`);
+        verboseLog(`request: ${init?.method || 'GET'} ${url}`);
         const response = await fetch(url, init);
-        log.log(`response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
+        verboseLog(`response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
         if (!response.ok) {
             const text = await response.text().catch(() => '');
             log.log(`ERROR body: ${text.substring(0, 500)}`);

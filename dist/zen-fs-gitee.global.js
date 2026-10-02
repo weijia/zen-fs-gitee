@@ -18544,18 +18544,24 @@ var ZenFSGitee = (() => {
     return path.replace(/^\/+/, "");
   }
   function mtimePathFor(filePath) {
+    if (filePath.endsWith(".mtime")) {
+      console.warn(
+        `[zen-fs-gitee] mtimePathFor received a path that already ends with ".mtime" (${filePath}); returning it unchanged to avoid a nested sidecar. Pass the data file path instead.`
+      );
+      return filePath;
+    }
     const lastSlash = filePath.lastIndexOf("/");
     const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash + 1) : "";
     const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-    const mtimeFileName = fileName.startsWith(".") ? `${fileName}.mtime` : `.${fileName}.mtime`;
+    const mtimeFileName = `${fileName}.mtime`;
     return `${dir}${mtimeFileName}`;
   }
   function sidecarToDataPath(sidecarPath) {
     const lastSlash = sidecarPath.lastIndexOf("/");
     const dir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash + 1) : "";
     const fileName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
-    if (!fileName.startsWith(".") || !fileName.endsWith(".mtime")) return null;
-    const dataFilename = fileName.slice(1, -6);
+    if (!fileName.endsWith(".mtime")) return null;
+    const dataFilename = fileName.slice(0, -6);
     if (dataFilename === "") return null;
     return `${dir}${dataFilename}`;
   }
@@ -18629,6 +18635,17 @@ var ZenFSGitee = (() => {
 
   // src/gitee-api.ts
   var log2 = createLogger("GiteeAPI");
+  var VERBOSE_KEY = "debug:verbose:GiteeAPI";
+  try {
+    if (localStorage.getItem(VERBOSE_KEY) === null) localStorage.setItem(VERBOSE_KEY, "0");
+  } catch {
+  }
+  function verboseLog(...args) {
+    try {
+      if (localStorage.getItem(VERBOSE_KEY) === "1") console.log("[GiteeAPI]", ...args);
+    } catch {
+    }
+  }
   var GiteeAPI = class {
     token;
     owner;
@@ -18645,9 +18662,9 @@ var ZenFSGitee = (() => {
     async request(path, init2) {
       const separator = path.includes("?") ? "&" : "?";
       const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
-      log2.log(`request: ${init2?.method || "GET"} ${url}`);
+      verboseLog(`request: ${init2?.method || "GET"} ${url}`);
       const response = await fetch(url, init2);
-      log2.log(`response: status=${response.status} url=${response.url} type=${response.headers.get("content-type")}`);
+      verboseLog(`response: status=${response.status} url=${response.url} type=${response.headers.get("content-type")}`);
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         log2.log(`ERROR body: ${text.substring(0, 500)}`);
@@ -18857,6 +18874,17 @@ var ZenFSGitee = (() => {
 
   // src/gitee-fs.ts
   var log3 = createLogger("GiteeFS");
+  var GITEEFS_VERBOSE_KEY = "debug:verbose:GiteeFS";
+  try {
+    if (localStorage.getItem(GITEEFS_VERBOSE_KEY) === null) localStorage.setItem(GITEEFS_VERBOSE_KEY, "0");
+  } catch {
+  }
+  function diagLog(...args) {
+    try {
+      if (localStorage.getItem(GITEEFS_VERBOSE_KEY) === "1") console.log("[GiteeFS:diag]", ...args);
+    } catch {
+    }
+  }
   var NO_SIDECAR_TTL_MS = 10 * 60 * 1e3;
   var GiteeFS = class extends IndexFS {
     api;
@@ -19476,8 +19504,8 @@ var ZenFSGitee = (() => {
         this.mtimeCache.set(path, entry);
         this._persistMtime(path, entry);
       }
-      console.log(
-        "[DIAG-GITEE] writeFileWithMtime DONE",
+      diagLog(
+        "writeFileWithMtime DONE",
         path,
         "mtimeMs=",
         mtimeMs,

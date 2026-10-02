@@ -5,6 +5,27 @@ import { IdbKVStore } from 'zen-fs-cache';
 import { GiteeAPI } from './gitee-api.js';
 import { createLogger } from '@richard432/localstorage-logger';
 const log = createLogger('GiteeFS');
+/**
+ * Verbose writeFileWithMtime diagnostic. Hidden by default — enable with:
+ *   localStorage.setItem('debug:verbose:GiteeFS', '1')
+ */
+const GITEEFS_VERBOSE_KEY = 'debug:verbose:GiteeFS';
+try {
+    if (localStorage.getItem(GITEEFS_VERBOSE_KEY) === null)
+        localStorage.setItem(GITEEFS_VERBOSE_KEY, '0');
+}
+catch {
+    /* localStorage unavailable (Node.js) — stays hidden */
+}
+function diagLog(...args) {
+    try {
+        if (localStorage.getItem(GITEEFS_VERBOSE_KEY) === '1')
+            console.log('[GiteeFS:diag]', ...args);
+    }
+    catch {
+        /* ignore */
+    }
+}
 import { mtimePathFor, sidecarToDataPath, shaHash } from './utils.js';
 /** TTL (ms) for the negative cache of "path has no .mtime sidecar" — avoids 404 storms. */
 const NO_SIDECAR_TTL_MS = 10 * 60 * 1000;
@@ -282,8 +303,9 @@ export class GiteeFS extends IndexFS {
         }
         // Mtime sidecar files (not in index but in shaCache)
         for (const [path] of this.shaCache) {
-            // sidecarToDataPath detects directory-prefixed sidecars correctly
-            // (isMtimeSidecar only matched strings starting with '.').
+            // sidecarToDataPath reliably detects every `<name>.mtime` sidecar
+            // (including those whose data path is directory-prefixed) and maps
+            // them back to the data file, so non-sidecar paths are skipped.
             if (!sidecarToDataPath(path))
                 continue;
             if (this.contentCache.has(path))
@@ -760,7 +782,7 @@ export class GiteeFS extends IndexFS {
             this.mtimeCache.set(path, entry);
             this._persistMtime(path, entry);
         }
-        console.log('[DIAG-GITEE] writeFileWithMtime DONE', path, 'mtimeMs=', mtimeMs, 'mtimeCache.fromSidecar=', this.mtimeCache.get(path)?.fromSidecar, 'noSidecarCache.has=', this.noSidecarCache.has(path));
+        diagLog('writeFileWithMtime DONE', path, 'mtimeMs=', mtimeMs, 'mtimeCache.fromSidecar=', this.mtimeCache.get(path)?.fromSidecar, 'noSidecarCache.has=', this.noSidecarCache.has(path));
     }
     // -----------------------------------------------------------------------
     // createSnapshot — efficient snapshot using Git tree API

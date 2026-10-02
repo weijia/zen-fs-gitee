@@ -52,19 +52,25 @@ describe('utils', () => {
 
 	describe('mtimePathFor', () => {
 		it('converts a file in the root to a sidecar path', () => {
-			expect(mtimePathFor('/config.json')).toBe('/.config.json.mtime');
+			expect(mtimePathFor('/config.json')).toBe('/config.json.mtime');
 		});
 
 		it('converts a file in a subdirectory to a sidecar path', () => {
-			expect(mtimePathFor('/documents/note.json')).toBe('/documents/.note.json.mtime');
+			expect(mtimePathFor('/documents/note.json')).toBe('/documents/note.json.mtime');
 		});
 
 		it('converts a deeply nested file to a sidecar path', () => {
-			expect(mtimePathFor('/a/b/c/d.json')).toBe('/a/b/c/.d.json.mtime');
+			expect(mtimePathFor('/a/b/c/d.json')).toBe('/a/b/c/d.json.mtime');
 		});
 
 		it('handles a path with no leading slash', () => {
-			expect(mtimePathFor('config.json')).toBe('.config.json.mtime');
+			expect(mtimePathFor('config.json')).toBe('config.json.mtime');
+		});
+
+		it('round-trips a dotfile (.keep) via sidecarToDataPath', () => {
+			const sidecar = mtimePathFor('/nodes/.keep');
+			expect(sidecar).toBe('/nodes/.keep.mtime');
+			expect(sidecarToDataPath(sidecar)).toBe('/nodes/.keep');
 		});
 	});
 
@@ -81,8 +87,8 @@ describe('utils', () => {
 			expect(isMtimeSidecar('config.json')).toBe(false);
 		});
 
-		it('returns false when the file ends with .mtime but does not start with a dot', () => {
-			expect(isMtimeSidecar('config.mtime')).toBe(false);
+		it('returns true for a plain filename ending in .mtime (now treated as a sidecar)', () => {
+			expect(isMtimeSidecar('config.mtime')).toBe(true);
 		});
 
 		it('returns false when the file starts with a dot but does not end with .mtime', () => {
@@ -122,11 +128,11 @@ describe('utils', () => {
 
 	describe('sidecarToDataPath', () => {
 		it('reverses a sidecar path in a subdirectory', () => {
-			expect(sidecarToDataPath('/documents/.note.json.mtime')).toBe('/documents/note.json');
+			expect(sidecarToDataPath('/documents/note.json.mtime')).toBe('/documents/note.json');
 		});
 
 		it('reverses a sidecar path in the root', () => {
-			expect(sidecarToDataPath('/.config.json.mtime')).toBe('/config.json');
+			expect(sidecarToDataPath('/config.json.mtime')).toBe('/config.json');
 		});
 
 		it('returns null for a path that is not a sidecar', () => {
@@ -139,6 +145,10 @@ describe('utils', () => {
 
 		it('returns null when the path does not end with .mtime', () => {
 			expect(sidecarToDataPath('/.config.json')).toBeNull();
+		});
+
+		it('reverses a dotfile sidecar (.keep.mtime) back to the dotfile', () => {
+			expect(sidecarToDataPath('/nodes/.keep.mtime')).toBe('/nodes/.keep');
 		});
 	});
 });

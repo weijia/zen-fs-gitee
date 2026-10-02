@@ -38,42 +38,61 @@ export function apiPath(path: string): string {
 /**
  * Compute the .mtime sidecar path for a given file path.
  *
- * /documents/note.json → /documents/.note.json.mtime
- * /config.json         → /.config.json.mtime
+ * /documents/note.json → /documents/note.json.mtime
+ * /documents/.note.json → /documents/.note.json.mtime
+ * /config.json         → /config.json.mtime
+ * /.keep               → /.keep.mtime
+ *
+ * NOTE: the sidecar is the data file name with `.mtime` appended — NO leading
+ * dot. This round-trips every name (including dotfiles) through
+ * {@link sidecarToDataPath}: `.keep` → `.keep.mtime` → `.keep`. The previous
+ * leading-dot convention (`.keep` → `.keep.mtime`, then reverse-stripping the
+ * leading dot → `keep`) could not round-trip dotfiles, hence the pure-suffix
+ * form. Trade-off: a user file literally named `*.mtime` is treated as a
+ * sidecar.
  */
 export function mtimePathFor(filePath: string): string {
-	const lastSlash = filePath.lastIndexOf('/');
-	const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash + 1) : '';
-	const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-	// Avoid double dot: if fileName already starts with '.', don't add another
-	// (so `.gitignore` → `.gitignore.mtime`, not `..gitignore.mtime`).
-	const mtimeFileName = fileName.startsWith('.') ? `${fileName}.mtime` : `.${fileName}.mtime`;
-	return `${dir}${mtimeFileName}`;
+  // Guard against nested sidecars: callers must pass the *data* file path, not
+  // a sidecar path. If a `.mtime` path slips through, warn and return it
+  // unchanged instead of producing a doubly-suffixed `*.mtime.mtime`.
+  if (filePath.endsWith('.mtime')) {
+    console.warn(
+      `[zen-fs-gitee] mtimePathFor received a path that already ends with ".mtime" (${filePath}); ` +
+      `returning it unchanged to avoid a nested sidecar. Pass the data file path instead.`,
+    );
+    return filePath;
+  }
+  const lastSlash = filePath.lastIndexOf('/');
+  const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash + 1) : '';
+  const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
+  const mtimeFileName = `${fileName}.mtime`;
+  return `${dir}${mtimeFileName}`;
 }
 
 /**
  * Check whether a filename is a .mtime sidecar file.
  *
- * .note.json.mtime → true
- * note.json        → false
+ * note.json.mtime → true
+ * note.json       → false
  */
 export function isMtimeSidecar(name: string): boolean {
-	return name.startsWith('.') && name.endsWith('.mtime');
+	return name.endsWith('.mtime') && name.length > 6;
 }
 
 /**
  * Reverse: given a sidecar path, return the data file path.
  *
- * /documents/.note.json.mtime → /documents/note.json
+ * /documents/note.json.mtime → /documents/note.json
+ * /nodes/.keep.mtime         → /nodes/.keep
  * Returns null if the path is not a valid sidecar.
  */
 export function sidecarToDataPath(sidecarPath: string): string | null {
 	const lastSlash = sidecarPath.lastIndexOf('/');
 	const dir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash + 1) : '';
 	const fileName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
-	if (!fileName.startsWith('.') || !fileName.endsWith('.mtime')) return null;
-	const dataFilename = fileName.slice(1, -6); // remove leading '.' and trailing '.mtime'
-	if (dataFilename === '') return null; // e.g. '.mtime' has no filename between dot and .mtime
+	if (!fileName.endsWith('.mtime')) return null;
+	const dataFilename = fileName.slice(0, -6); // remove trailing '.mtime'
+	if (dataFilename === '') return null; // e.g. '.mtime' has no filename
 	return `${dir}${dataFilename}`;
 }
 

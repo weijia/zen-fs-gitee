@@ -422,7 +422,7 @@ describe('GiteeFS', () => {
 		const testMtime = 1700000000123;
 		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 			{ path: 'notes.md', type: 'blob', sha: 'sha1', size: 50, mode: '100644' },
-			{ path: '.notes.md.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+			{ path: 'notes.md.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
 		]));
 		await fs.init();
 
@@ -440,28 +440,28 @@ describe('GiteeFS', () => {
 	it('init skips sidecar files from index but caches their SHA', async () => {
 		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 			{ path: 'config.json', type: 'blob', sha: 'data-sha', size: 100, mode: '100644' },
-			{ path: '.config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+			{ path: 'config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
 		]));
 		await fs.init();
 
 		// Data file should be in index
 		expect(fs.index.has('/config.json')).toBe(true);
 		// Sidecar should NOT be in index
-		expect(fs.index.has('/.config.json.mtime')).toBe(false);
+		expect(fs.index.has('/config.json.mtime')).toBe(false);
 		// But sidecar SHA should be cached
-		expect(fs.shaCache.get('/.config.json.mtime')).toBe('sidecar-sha');
+		expect(fs.shaCache.get('/config.json.mtime')).toBe('sidecar-sha');
 	});
 
 	it('remove deletes both data file and sidecar separately via Contents API', async () => {
 		fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 			{ path: 'config.json', type: 'blob', sha: 'data-sha', size: 100, mode: '100644' },
-			{ path: '.config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
+			{ path: 'config.json.mtime', type: 'blob', sha: 'sidecar-sha', size: 13, mode: '100644' },
 		]));
 		await fs.init();
 
 		// Mock the two separate deleteFile calls via Contents API:
 		// 1. deleteFile (data file config.json) -> returns { commit: { sha } }
-		// 2. deleteFile (sidecar .config.json.mtime) -> returns { commit: { sha } }
+		// 2. deleteFile (sidecar config.json.mtime) -> returns { commit: { sha } }
 		fetchSpy.mockResolvedValueOnce(mockOkJson({ commit: { sha: 'commit-sha' } }));
 		fetchSpy.mockResolvedValueOnce(mockOkJson({ commit: { sha: 'commit-sha' } }));
 
@@ -469,7 +469,7 @@ describe('GiteeFS', () => {
 
 		// Both SHAs should be removed from cache
 		expect(fs.shaCache.has('/config.json')).toBe(false);
-		expect(fs.shaCache.has('/.config.json.mtime')).toBe(false);
+		expect(fs.shaCache.has('/config.json.mtime')).toBe(false);
 		expect(fs.contentCache.has('/config.json')).toBe(false);
 	});
 });
@@ -507,7 +507,7 @@ describe('GiteeFS', () => {
 			// exists in the tree, so it calls createFile for the sidecar (returns
 			// content.sha). Each Contents API call is exactly one fetch.
 			// 1. updateFile (data file config.json) -> { content: { sha: 'new-data-sha' } }
-			// 2. createFile (sidecar .config.json.mtime) -> { content: { sha: 'new-sidecar-sha' } }
+			// 2. createFile (sidecar config.json.mtime) -> { content: { sha: 'new-sidecar-sha' } }
 			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-data-sha' } }));
 			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-sidecar-sha' } }));
 
@@ -519,13 +519,13 @@ describe('GiteeFS', () => {
 			expect(new TextDecoder().decode(cached!)).toBe(testData);
 
 			// Sidecar content should be cached
-			const sidecarCached = fs.contentCache.get('/.config.json.mtime');
+			const sidecarCached = fs.contentCache.get('/config.json.mtime');
 			expect(sidecarCached).toBeDefined();
 			expect(new TextDecoder().decode(sidecarCached!)).toBe(String(testMtime));
 
 			// SHA caches should be updated with the SHAs returned by the Contents API
 			expect(fs.shaCache.get('/config.json')).toBe('new-data-sha');
-			expect(fs.shaCache.get('/.config.json.mtime')).toBe('new-sidecar-sha');
+			expect(fs.shaCache.get('/config.json.mtime')).toBe('new-sidecar-sha');
 		});
 
 		it('accepts Uint8Array data', async () => {
@@ -537,14 +537,14 @@ describe('GiteeFS', () => {
 
 			// Empty tree (no existing files), so both data and sidecar use createFile.
 			// 1. createFile (data file binary.dat) -> { content: { sha: 'data-sha' } }
-			// 2. createFile (sidecar .binary.dat.mtime) -> { content: { sha: 'sidecar-sha' } }
+			// 2. createFile (sidecar binary.dat.mtime) -> { content: { sha: 'sidecar-sha' } }
 			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'data-sha' } }));
 			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'sidecar-sha' } }));
 
 			await fs.writeFileWithMtime('/binary.dat', testData, testMtime);
 
 			expect(fs.shaCache.get('/binary.dat')).toBe('data-sha');
-			expect(fs.shaCache.get('/.binary.dat.mtime')).toBe('sidecar-sha');
+			expect(fs.shaCache.get('/binary.dat.mtime')).toBe('sidecar-sha');
 			});
 
 			// ---------------------------------------------------------------------------
@@ -620,7 +620,7 @@ describe('GiteeFS', () => {
 			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 				{ path: 'config.json', type: 'blob', sha: 'sha-aaa', size: 100, mode: '100644' },
 				{ path: 'notes.md', type: 'blob', sha: 'sha-bbb', size: 50, mode: '100644' },
-				{ path: '.config.json.mtime', type: 'blob', sha: 'sha-sidecar', size: 13, mode: '100644' },
+				{ path: 'config.json.mtime', type: 'blob', sha: 'sha-sidecar', size: 13, mode: '100644' },
 				{ path: 'src', type: 'tree', sha: 'tree-sha', mode: '040000' },
 				{ path: 'src/index.ts', type: 'blob', sha: 'sha-ccc', size: 200, mode: '100644' },
 			]));
@@ -633,7 +633,7 @@ describe('GiteeFS', () => {
 			expect(snapshot!.has('config.json')).toBe(true);
 			expect(snapshot!.has('notes.md')).toBe(true);
 			expect(snapshot!.has('src/index.ts')).toBe(true);
-			expect(snapshot!.has('.config.json.mtime')).toBe(false);
+			expect(snapshot!.has('config.json.mtime')).toBe(false);
 
 			// Each entry should have shaHash as mtimeMs proxy
 			const entry = snapshot!.get('config.json')!;
@@ -682,8 +682,8 @@ describe('GiteeFS', () => {
 				// for dotfile data files must never surface as user-visible entries.
 				fetchSpy.mockResolvedValueOnce(mockTreeResponse([
 					{ path: 'config.json', type: 'blob', sha: 'sha-aaa', size: 100, mode: '100644' },
-					{ path: '.config.json.mtime', type: 'blob', sha: 'sha-s1', size: 13, mode: '100644' },
-					{ path: '.config.json.mtime.mtime', type: 'blob', sha: 'sha-s2', size: 13, mode: '100644' },
+					{ path: 'config.json.mtime', type: 'blob', sha: 'sha-s1', size: 13, mode: '100644' },
+					{ path: 'config.json.mtime.mtime', type: 'blob', sha: 'sha-s2', size: 13, mode: '100644' },
 					{ path: '.group-type.mtime', type: 'blob', sha: 'sha-s3', size: 13, mode: '100644' },
 					{ path: '.group-type.mtime.mtime', type: 'blob', sha: 'sha-s4', size: 13, mode: '100644' },
 				]));
@@ -692,8 +692,8 @@ describe('GiteeFS', () => {
 				expect(snapshot).not.toBeNull();
 				expect(snapshot!.size).toBe(1); // only config.json; sidecars excluded
 				expect(snapshot!.has('config.json')).toBe(true);
-				expect(snapshot!.has('.config.json.mtime')).toBe(false);
-				expect(snapshot!.has('.config.json.mtime.mtime')).toBe(false);
+				expect(snapshot!.has('config.json.mtime')).toBe(false);
+				expect(snapshot!.has('config.json.mtime.mtime')).toBe(false);
 				expect(snapshot!.has('.group-type.mtime')).toBe(false);
 				expect(snapshot!.has('.group-type.mtime.mtime')).toBe(false);
 			});
