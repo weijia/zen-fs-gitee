@@ -683,8 +683,8 @@ export class GiteeFS extends IndexFS {
 		//    caused the endless MTIME NORMALIZE loop (target mtime changed every
 		//    sync → source/target never agreed → re-PUT the same content).
 		if (cached && cached.sha === currentSha) {
-			const neg = this.noSidecarCache.get(path);
-			const negFresh = neg !== undefined && Date.now() - neg <= NO_SIDECAR_TTL_MS;
+			const neg2 = this.noSidecarCache.get(path);
+			const negFresh = neg2 !== undefined && Date.now() - neg2 <= NO_SIDECAR_TTL_MS;
 			console.log('[DIAG-GITEE] stat step1', path, 'fromSidecar=', cached.fromSidecar, 'noSidecarFresh=', negFresh, 'cachedMtime=', cached.lastModified);
 			if (cached.fromSidecar) {
 				inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
