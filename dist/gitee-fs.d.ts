@@ -187,9 +187,18 @@ export declare class GiteeFS extends IndexFS {
      */
     createSnapshot(root: string, filter?: SnapshotFilter): Promise<Map<string, SnapshotEntry> | null>;
     /**
-     * Get the blob SHA for a file (from shaCache). Useful for external
-     * revision checking (e.g. zen-fs-cache getRevision).
-     */
+    * Recursively delete `.mtime` sidecar files whose data file no longer
+    * exists in the Gitee repo (orphaned sidecars). Returns the number of
+    * sidecars removed. Safe to call at any time; each deletion is best-effort.
+    *
+    * NOTE: `createSnapshot()` already prunes orphans on the fly during normal
+    * sync; this method forces an explicit, on-demand full cleanup.
+    */
+    pruneOrphanedMtimeSidecars(root?: string): Promise<number>;
+    /**
+    * Get the blob SHA for a file (from shaCache). Useful for external
+* revision checking (e.g. zen-fs-cache getRevision).
+*/
     getFileSha(path: string): string | undefined;
     /**
      * Return a revision token for `path`, implementing the

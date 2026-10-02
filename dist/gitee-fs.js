@@ -893,6 +893,33 @@ export class GiteeFS extends IndexFS {
                     mtimeMs,
                 });
             }
+            // Dynamic cleanup: delete orphaned `.mtime` sidecars (a sidecar whose
+            // data file no longer exists in the repo). Detection reuses this tree,
+            // so no extra API call. Best-effort; failures are logged and ignored.
+            const allDataPaths = new Set();
+            const sidecarItems = [];
+            for (const item of tree) {
+                if (item.type === 'tree')
+                    continue;
+                const dataPath = sidecarToDataPath(item.path);
+                if (dataPath)
+                    sidecarItems.push({ path: item.path, sha: item.sha });
+                else
+                    allDataPaths.add(item.path);
+            }
+            for (const sc of sidecarItems) {
+                const dataPath = sidecarToDataPath(sc.path);
+                const orphaned = sc.path.endsWith('.mtime.mtime') || !allDataPaths.has(dataPath);
+                if (!orphaned)
+                    continue;
+                const full = '/' + sc.path;
+                log.warn(`createSnapshot: pruning orphaned mtime sidecar ${full}`);
+                if (typeof this.api.deleteFile === 'function') {
+                    void this.api.deleteFile(full, sc.sha, `Prune orphaned mtime sidecar ${full}`)
+                        .then(() => { this.shaCache.delete(full); this._deleteSha(full); })
+                        .catch((e) => log.warn(`createSnapshot: failed to prune ${full}:`, e));
+                }
+            }
             return snapshot;
         }
         catch (err) {
@@ -901,9 +928,52 @@ export class GiteeFS extends IndexFS {
         }
     }
     /**
-     * Get the blob SHA for a file (from shaCache). Useful for external
-     * revision checking (e.g. zen-fs-cache getRevision).
-     */
+    * Recursively delete `.mtime` sidecar files whose data file no longer
+    * exists in the Gitee repo (orphaned sidecars). Returns the number of
+    * sidecars removed. Safe to call at any time; each deletion is best-effort.
+    *
+    * NOTE: `createSnapshot()` already prunes orphans on the fly during normal
+    * sync; this method forces an explicit, on-demand full cleanup.
+    */
+    async pruneOrphanedMtimeSidecars(root = '/') {
+        const normalizedRoot = root === '/' ? '' : root.replace(/^\/+|\/+$/g, '');
+        const tree = await this.api.getTree(true);
+        const allDataPaths = new Set();
+        const sidecarItems = [];
+        for (const item of tree) {
+            if (item.type === 'tree')
+                continue;
+            const dataPath = sidecarToDataPath(item.path);
+            if (dataPath)
+                sidecarItems.push({ path: item.path, sha: item.sha });
+            else
+                allDataPaths.add(item.path);
+        }
+        let removed = 0;
+        for (const sc of sidecarItems) {
+            if (normalizedRoot && sc.path !== normalizedRoot && !sc.path.startsWith(normalizedRoot + '/'))
+                continue;
+            const dataPath = sidecarToDataPath(sc.path);
+            const orphaned = sc.path.endsWith('.mtime.mtime') || !allDataPaths.has(dataPath);
+            if (!orphaned)
+                continue;
+            const full = '/' + sc.path;
+            try {
+                await this.api.deleteFile(full, sc.sha, `Prune orphaned mtime sidecar ${full}`);
+                this.shaCache.delete(full);
+                this._deleteSha(full);
+                removed++;
+            }
+            catch (e) {
+                log.warn(`pruneOrphanedMtimeSidecars: failed to delete ${full}:`, e);
+            }
+        }
+        return removed;
+    }
+    /**
+    * Get the blob SHA for a file (from shaCache). Useful for external
+* revision checking (e.g. zen-fs-cache getRevision).
+*/
     getFileSha(path) {
         return this.shaCache.get(path);
     }
