@@ -675,6 +675,55 @@ describe('GiteeFS', () => {
 			expect(snapshot!.has('a.md')).toBe(true);
 			expect(snapshot!.has('b.md')).toBe(true);
 			expect(snapshot!.has('config.json')).toBe(false);
+			});
+
+			it('excludes nested (.mtime.mtime) and dotfile-data (.group-type.mtime) sidecars', async () => {
+				// Real leakage shapes observed in logs: nested sidecars and sidecars
+				// for dotfile data files must never surface as user-visible entries.
+				fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+					{ path: 'config.json', type: 'blob', sha: 'sha-aaa', size: 100, mode: '100644' },
+					{ path: '.config.json.mtime', type: 'blob', sha: 'sha-s1', size: 13, mode: '100644' },
+					{ path: '.config.json.mtime.mtime', type: 'blob', sha: 'sha-s2', size: 13, mode: '100644' },
+					{ path: '.group-type.mtime', type: 'blob', sha: 'sha-s3', size: 13, mode: '100644' },
+					{ path: '.group-type.mtime.mtime', type: 'blob', sha: 'sha-s4', size: 13, mode: '100644' },
+				]));
+
+				const snapshot = await fs.createSnapshot('/', undefined);
+				expect(snapshot).not.toBeNull();
+				expect(snapshot!.size).toBe(1); // only config.json; sidecars excluded
+				expect(snapshot!.has('config.json')).toBe(true);
+				expect(snapshot!.has('.config.json.mtime')).toBe(false);
+				expect(snapshot!.has('.config.json.mtime.mtime')).toBe(false);
+				expect(snapshot!.has('.group-type.mtime')).toBe(false);
+				expect(snapshot!.has('.group-type.mtime.mtime')).toBe(false);
+			});
+		});
+
+	describe('writeFileWithMtime never nests mtime sidecars', () => {
+		it('does NOT create a nested .mtime.mtime when given a sidecar path', async () => {
+			const createdPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') {
+					createdPaths.push(String(url));
+				}
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					headers: new Headers({ 'content-type': 'application/json' }),
+					json: async () => ({ content: { sha: 'new-sha' } }),
+					text: async () => '',
+					arrayBuffer: async () => new ArrayBuffer(0),
+				} as Response);
+			});
+
+			// Writing a `.mtime` sidecar as if it were a regular file must not
+			// produce a nested `.mtime.mtime` (the bug that generated the
+			// historical `.group-type.mtime.mtime` files).
+			await fs.writeFileWithMtime('/.group-type.mtime', '{"mtime":123}', 1700000000123);
+
+			expect(createdPaths.some((u) => u.includes('.mtime.mtime'))).toBe(false);
+			// The data file itself is still written.
+			expect(createdPaths.some((u) => u.includes('.group-type.mtime'))).toBe(true);
 		});
 	});
 });

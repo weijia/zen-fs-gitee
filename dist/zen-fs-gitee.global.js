@@ -18860,6 +18860,11 @@ var ZenFSGitee = (() => {
   var NO_SIDECAR_TTL_MS = 10 * 60 * 1e3;
   var GiteeFS = class extends IndexFS {
     api;
+    /**
+     * Human-readable backend identifier used by zen-fs-sync diagnostics
+     * (e.g. naming the backend that leaked a mtime sidecar in a warning).
+     */
+    backendName;
     /** Maps file paths to their blob SHA (needed for updates/deletes). */
     shaCache = /* @__PURE__ */ new Map();
     /** In-memory content cache to support synchronous reads. */
@@ -18887,6 +18892,7 @@ var ZenFSGitee = (() => {
       super(444150867301, "gitee", new Index());
       this.options = options;
       this.api = new GiteeAPI(options);
+      this.backendName = `Gitee@${options.owner}/${options.repo}`;
       const dbBase = `zen-fs-gitee:${options.owner}/${options.repo}`;
       this.shaStore = new IdbKVStore(`${dbBase}:sha`, "cache");
       this.contentStore = new IdbKVStore(`${dbBase}:content`, "cache");
@@ -19440,21 +19446,25 @@ var ZenFSGitee = (() => {
       } else {
         newDataSha = await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
       }
-      const existingSidecarSha = this.shaCache.get(sidecarPath);
-      let newSidecarSha;
-      if (existingSidecarSha) {
-        newSidecarSha = await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`);
-      } else {
-        newSidecarSha = await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
-      }
       this.contentCache.set(path, content);
-      this.contentCache.set(sidecarPath, sidecarContent);
       this._persistContent(path, content);
-      this._persistContent(sidecarPath, sidecarContent);
       this.shaCache.set(path, newDataSha);
-      this.shaCache.set(sidecarPath, newSidecarSha);
       this._persistSha(path, newDataSha);
-      this._persistSha(sidecarPath, newSidecarSha);
+      if (sidecarToDataPath(path) === null) {
+        const existingSidecarSha = this.shaCache.get(sidecarPath);
+        let newSidecarSha;
+        if (existingSidecarSha) {
+          newSidecarSha = await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`);
+        } else {
+          newSidecarSha = await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+        }
+        this.contentCache.set(sidecarPath, sidecarContent);
+        this._persistContent(sidecarPath, sidecarContent);
+        this.shaCache.set(sidecarPath, newSidecarSha);
+        this._persistSha(sidecarPath, newSidecarSha);
+      } else {
+        log3.warn(`writeFileWithMtime: refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar)`);
+      }
       const inode = this.index.get(path);
       if (inode) {
         inode.update({ mtimeMs, size: content.length });

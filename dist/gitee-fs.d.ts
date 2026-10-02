@@ -26,6 +26,11 @@ export interface SnapshotFilter {
  */
 export declare class GiteeFS extends IndexFS {
     readonly api: GiteeAPI;
+    /**
+     * Human-readable backend identifier used by zen-fs-sync diagnostics
+     * (e.g. naming the backend that leaked a mtime sidecar in a warning).
+     */
+    readonly backendName: string;
     /** Maps file paths to their blob SHA (needed for updates/deletes). */
     readonly shaCache: Map<string, string>;
     /** In-memory content cache to support synchronous reads. */
