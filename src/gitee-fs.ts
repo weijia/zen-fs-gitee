@@ -831,6 +831,21 @@ export class GiteeFS extends IndexFS {
 		if (inode) {
 			inode.update({ mtimeMs, size: content.length });
 		}
+
+		// 4b. Refresh the data file's mtime cache so the next stat() immediately
+		// sees the real preserved mtime (fromSidecar: true) instead of falling
+		// back to the ever-changing commit time (which re-triggers MTIME
+		// NORMALIZE). writeFileWithMtime() writes the sidecar via the raw API and
+		// bypasses the local index, so the cache must be refreshed here — same
+		// as writeMtimeSidecar()/writeMtimeSidecarSync().
+		this.noSidecarCache.delete(path);
+		const dataSha = this.shaCache.get(path);
+		if (dataSha) {
+			const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+			this.mtimeCache.set(path, entry);
+			this._persistMtime(path, entry);
+		}
+
 		console.log('[DIAG-GITEE] writeFileWithMtime DONE', path, 'mtimeMs=', mtimeMs,
 			'mtimeCache.fromSidecar=', this.mtimeCache.get(path)?.fromSidecar,
 			'noSidecarCache.has=', this.noSidecarCache.has(path));

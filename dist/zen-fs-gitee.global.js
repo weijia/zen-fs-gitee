@@ -19353,12 +19353,15 @@ var ZenFSGitee = (() => {
       const currentSha = this.shaCache.get(path);
       const cached = this.mtimeCache.get(path);
       if (cached && cached.sha === currentSha) {
+        const neg2 = this.noSidecarCache.get(path);
+        const negFresh = neg2 !== void 0 && Date.now() - neg2 <= NO_SIDECAR_TTL_MS;
+        console.log("[DIAG-GITEE] stat step1", path, "fromSidecar=", cached.fromSidecar, "noSidecarFresh=", negFresh, "cachedMtime=", cached.lastModified);
         if (cached.fromSidecar) {
           inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
           return inode;
         }
-        const neg2 = this.noSidecarCache.get(path);
-        if (neg2 !== void 0 && Date.now() - neg2 <= NO_SIDECAR_TTL_MS) {
+        const neg3 = this.noSidecarCache.get(path);
+        if (neg3 !== void 0 && Date.now() - neg3 <= NO_SIDECAR_TTL_MS) {
           inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
           return inode;
         }
@@ -19394,6 +19397,7 @@ var ZenFSGitee = (() => {
           const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
           this.mtimeCache.set(path, mtimeEntry);
           this._persistMtime(path, mtimeEntry);
+          console.log("[DIAG-GITEE] stat step3 COMMIT-FALLBACK", path, "commitDate=", commit.date, "=> mtime=", new Date(commit.date).getTime());
           inode.update({ mtimeMs: new Date(commit.date).getTime() });
           return inode;
         }
@@ -19455,6 +19459,23 @@ var ZenFSGitee = (() => {
       if (inode) {
         inode.update({ mtimeMs, size: content.length });
       }
+      this.noSidecarCache.delete(path);
+      const dataSha = this.shaCache.get(path);
+      if (dataSha) {
+        const entry = { sha: dataSha, lastModified: new Date(mtimeMs).toISOString(), fromSidecar: true };
+        this.mtimeCache.set(path, entry);
+        this._persistMtime(path, entry);
+      }
+      console.log(
+        "[DIAG-GITEE] writeFileWithMtime DONE",
+        path,
+        "mtimeMs=",
+        mtimeMs,
+        "mtimeCache.fromSidecar=",
+        this.mtimeCache.get(path)?.fromSidecar,
+        "noSidecarCache.has=",
+        this.noSidecarCache.has(path)
+      );
     }
     // -----------------------------------------------------------------------
     // createSnapshot — efficient snapshot using Git tree API

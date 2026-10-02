@@ -545,8 +545,75 @@ describe('GiteeFS', () => {
 
 			expect(fs.shaCache.get('/binary.dat')).toBe('data-sha');
 			expect(fs.shaCache.get('/.binary.dat.mtime')).toBe('sidecar-sha');
-		});
-	});
+			});
+
+			// ---------------------------------------------------------------------------
+			// Bug repro: writeFileWithMtime must record the sidecar as *authoritative*
+			// (fromSidecar:true) in mtimeCache AND clear noSidecarCache. Without this,
+			// the next stat() trusts the Commits API commit time instead of the
+			// preserved mtime → MTIME NORMALIZE loop (identical content re-PUT every
+			// sync cycle, target mtime never stabilizes).
+			// ---------------------------------------------------------------------------
+
+			it('BUG REPRO: records sidecar as authoritative in mtimeCache and clears noSidecarCache', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'old-sha', size: 50, mode: '100644' },
+			]));
+			await fs.init();
+
+			const testMtime = 1700000000123;
+			const testData = '{"key":"value"}';
+
+			// updateFile (data, identical-ish) → new-data-sha; createFile (sidecar) → new-sidecar-sha
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-data-sha' } }));
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'new-sidecar-sha' } }));
+
+			await fs.writeFileWithMtime('/config.json', testData, testMtime);
+
+			const entry = fs.mtimeCache.get('/config.json');
+			expect(entry).toBeDefined();
+			// Currently FAILS: writeFileWithMtime never sets fromSidecar:true, so
+			// entry is undefined (or fromSidecar:false if a prior stat cached it).
+			expect(entry!.fromSidecar).toBe(true);
+			expect(entry!.sha).toBe('new-data-sha');
+			expect(entry!.lastModified).toBe(new Date(testMtime).toISOString());
+			// Negative "no sidecar" cache must be cleared so stat() re-reads the
+			// sidecar instead of trusting a stale commit time.
+			expect(fs.noSidecarCache.has('/config.json')).toBe(false);
+			});
+
+			it('BUG REPRO: post-write stat returns preserved mtime (not commit time) — no NORMALIZE loop', async () => {
+			const testMtime = 1700000000123;
+			const commitTime = '2025-03-01T00:00:00+08:00';
+			const data = '{"key":"value"}';
+
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'S1', size: data.length, mode: '100644' },
+			]));
+			await fs.init();
+
+			// 1) First stat: sidecar absent on server → getRaw throws → negative
+			//    cache set, then Commits API fallback caches commit time as
+			//    { fromSidecar: false, sha: 'S1' }.
+			fs.api.getRaw = async () => { throw new Error('404 Not Found'); };
+			fs.api.getLastCommit = async () => ({ date: commitTime, sha: 'commit-sha' });
+			await fs.stat('/config.json');
+
+			// 2) MTIME NORMALIZE case: content is IDENTICAL, only mtime differs.
+			//    updateFile returns the SAME blob sha 'S1' (content-addressing),
+			//    and the .mtime sidecar carrying testMtime is created.
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'S1' } })); // updateFile (same sha)
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'SC' } }));  // createFile (sidecar)
+			await fs.writeFileWithMtime('/config.json', data, testMtime);
+
+			// 3) Next sync cycle. Data SHA unchanged ('S1') → stat() hits its
+			//    cached entry. With the bug: fromSidecar=false + fresh noSidecarCache
+			//    → returns the COMMIT time, never the preserved testMtime → loop.
+			//    After the fix: returns testMtime and converges.
+			const inode = await fs.stat('/config.json');
+			expect(inode.mtimeMs).toBe(testMtime); // preserved mtime must win
+			});
+			});
 
 	describe('createSnapshot', () => {
 		it('builds snapshot from Git tree API excluding sidecar files', async () => {
