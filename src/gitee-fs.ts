@@ -683,6 +683,9 @@ export class GiteeFS extends IndexFS {
 		//    caused the endless MTIME NORMALIZE loop (target mtime changed every
 		//    sync → source/target never agreed → re-PUT the same content).
 		if (cached && cached.sha === currentSha) {
+			const neg = this.noSidecarCache.get(path);
+			const negFresh = neg !== undefined && Date.now() - neg <= NO_SIDECAR_TTL_MS;
+			console.log('[DIAG-GITEE] stat step1', path, 'fromSidecar=', cached.fromSidecar, 'noSidecarFresh=', negFresh, 'cachedMtime=', cached.lastModified);
 			if (cached.fromSidecar) {
 				inode.update({ mtimeMs: new Date(cached.lastModified).getTime() });
 				return inode;
@@ -745,6 +748,7 @@ export class GiteeFS extends IndexFS {
 				const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
 				this.mtimeCache.set(path, mtimeEntry);
 				this._persistMtime(path, mtimeEntry);
+				console.log('[DIAG-GITEE] stat step3 COMMIT-FALLBACK', path, 'commitDate=', commit.date, '=> mtime=', new Date(commit.date).getTime());
 				inode.update({ mtimeMs: new Date(commit.date).getTime() });
 				return inode;
 			}
@@ -827,6 +831,9 @@ export class GiteeFS extends IndexFS {
 		if (inode) {
 			inode.update({ mtimeMs, size: content.length });
 		}
+		console.log('[DIAG-GITEE] writeFileWithMtime DONE', path, 'mtimeMs=', mtimeMs,
+			'mtimeCache.fromSidecar=', this.mtimeCache.get(path)?.fromSidecar,
+			'noSidecarCache.has=', this.noSidecarCache.has(path));
 	}
 
 	// -----------------------------------------------------------------------
