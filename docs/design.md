@@ -92,6 +92,8 @@
 ### 2.5 快照算法（DM-4）
 `createSnapshot(root, filter)`：① 单次 `getTree`；② 第一遍用 `sidecarToDataPath` 建 `数据路径→sidecar路径` 映射（比 `isMtimeSidecar` 更可靠，能识别目录前缀路径如 `documents/.note.json.mtime`）；③ 第二遍为每个数据文件生成条目，mtime 优先取 sidecar 真实值，否则 `shaHash(blobSha)` 内容稳定代理；④ 应用 `root`/`include`/`exclude` 前缀过滤；⑤ sidecar 文件被排除。API 不可达返回 `null`（fail-safe）。
 
+> **Backend contract reference**: Excluding `.mtime` sidecars from `createSnapshot` (and from `readdir` / `stat`) implements the "internal files must be hidden from callers" rule in `zen-fs-sync/docs/SyncableFS.md` → 《后端实现契约》§1. For empty-directory survival, see the same doc §2: a backend that cannot store empty directories must create **and hide** its own placeholder on `mkdir`, and the sync engine preserves empty dirs by calling `mkdir` on the target — not by syncing the placeholder. Gitee's current placeholder behavior and the `\n` consistency risk are tracked in §5 open problem #3.
+
 ### 2.6 变更探测（DM-5）
 `shouldSync()` 取分支最新提交 SHA 与 `lastCommitSha` 比较：相同→`false`；不同→更新基线并返回 `true`；首次/错误→`true`。仅 1 次 API 调用，不做树遍历。
 

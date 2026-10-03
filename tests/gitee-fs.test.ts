@@ -282,6 +282,19 @@ describe('GiteeFS', () => {
 			expect(entries).toContain('a.ts');
 			expect(entries).toContain('b.ts');
 		});
+
+		it('hides internal .keep placeholder from async readdir', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'src', type: 'tree', sha: 't1', mode: '040000' },
+				{ path: 'src/.keep', type: 'blob', sha: 'k1', size: 1, mode: '100644' },
+				{ path: 'src/a.ts', type: 'blob', sha: 'b1', size: 1, mode: '100644' },
+			]));
+			await fs.init();
+
+			const entries = await fs.readdir('/src');
+			expect(entries).toContain('a.ts');
+			expect(entries).not.toContain('.keep');
+		});
 	});
 
 	describe('stat', () => {
@@ -697,6 +710,19 @@ describe('GiteeFS', () => {
 				expect(snapshot!.has('.group-type.mtime')).toBe(false);
 				expect(snapshot!.has('.group-type.mtime.mtime')).toBe(false);
 			});
+
+			it('excludes internal .keep placeholder from snapshot', async () => {
+				fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+					{ path: 'config.json', type: 'blob', sha: 'sha-aaa', size: 100, mode: '100644' },
+					{ path: 'sub/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+				]));
+
+				const snapshot = await fs.createSnapshot('/', undefined);
+				expect(snapshot).not.toBeNull();
+				expect(snapshot!.has('config.json')).toBe(true);
+				// The internal placeholder must never surface as a user-visible entry.
+				expect(snapshot!.has('sub/.keep')).toBe(false);
+			});
 		});
 
 	describe('writeFileWithMtime never nests mtime sidecars', () => {
@@ -724,6 +750,36 @@ describe('GiteeFS', () => {
 			expect(createdPaths.some((u) => u.includes('.mtime.mtime'))).toBe(false);
 			// The data file itself is still written.
 			expect(createdPaths.some((u) => u.includes('.group-type.mtime'))).toBe(true);
+		});
+	});
+
+	describe('mkdir / rmdir — empty directory .keep placeholder', () => {
+		it('mkdir creates an internal .keep placeholder', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'keep-sha' } }));
+			await fs.mkdir('/newdir');
+
+			// The placeholder must be written internally so the empty directory
+			// survives in Git. It is hidden from readdir(), but present in the index.
+			expect(
+				fs.contentCache.has('/newdir/.keep') || fs.index.has('/newdir/.keep'),
+			).toBe(true);
+		});
+
+		it('rmdir removes the internal .keep before deleting the directory', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'newdir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'newdir/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({ commit: { sha: 'c' } }));
+			await fs.rmdir('/newdir');
+
+			expect(fs.shaCache.has('/newdir/.keep')).toBe(false);
+			expect(fs.index.has('/newdir')).toBe(false);
 		});
 	});
 });

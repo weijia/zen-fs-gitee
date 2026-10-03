@@ -939,12 +939,18 @@ export class GiteeFS extends IndexFS {
 
 			// Second pass: build snapshot for real data files.
 			for (const item of tree) {
-				// Skip directories
-				if (item.type === 'tree') continue;
+			  // Skip directories
+			  if (item.type === 'tree') continue;
 
-				// Skip mtime sidecar files (internal metadata) — also excludes
-				// them from appearing as user-visible files.
-				if (sidecarToDataPath(item.path)) {
+			  // Skip the internal `.keep` placeholder — it only keeps otherwise-empty
+			  // directories alive in Git and is not a user file. Hidden from callers
+			  // per the backend contract (zen-fs-sync/docs/SyncableFS.md §1/§2).
+			  const _keepBase = item.path.slice(item.path.lastIndexOf('/') + 1);
+			  if (_keepBase === '.keep') continue;
+
+			  // Skip mtime sidecar files (internal metadata) — also excludes
+			  // them from appearing as user-visible files.
+			  if (sidecarToDataPath(item.path)) {
 					// A nested sidecar (`*.mtime.mtime`) is a pathological artifact
 					// that must never be synced; warn so it can be cleaned up.
 					if (item.path.endsWith('.mtime.mtime')) {
@@ -1063,6 +1069,51 @@ export class GiteeFS extends IndexFS {
 			log.warn(`createSnapshot failed:`, err);
 			return null;
 			}
+			}
+
+			// ---------------------------------------------------------------------
+			// Empty-directory placeholder (`.keep`) handling.
+			//
+			// Git cannot store empty directories, so GiteeFS keeps a directory alive
+			// with an internal `.keep` placeholder — exactly like RemoteStorage. Per
+			// the backend contract (zen-fs-sync/docs/SyncableFS.md §1/§2) this
+			// placeholder is an internal implementation file that MUST be hidden from
+			// callers, while empty directories are preserved by the sync engine
+			// calling mkdir on the target (not by syncing the placeholder).
+			// ---------------------------------------------------------------------
+
+			async readdir(path: string): Promise<string[]> {
+				const names = await super.readdir(path);
+				return names.filter((n) => n !== '.keep');
+			}
+
+			async mkdir(path: string, options?: any): Promise<any> {
+				const result = await (super.mkdir as (p: string, o?: any) => Promise<any>)(path, options);
+				// Create an internal `.keep` placeholder so the (otherwise empty)
+				// directory survives in Git. Content is `\n` (matches Gitee's
+				// historical placeholder). Hidden by readdir() above.
+				const keepPath = `${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`;
+				try {
+					if (!(await this.exists(keepPath))) {
+						await this.writeFile(keepPath, '\n');
+					}
+				} catch {
+					// best-effort; directory entry already recorded by super.mkdir
+				}
+				return result;
+			}
+
+			async rmdir(path: string): Promise<void> {
+				// Remove the internal `.keep` first so the directory is empty before
+				// the base class removes its entry.
+				try {
+					await (super.unlink as (p: string) => Promise<any>)(
+						`${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`,
+					);
+				} catch {
+					// no placeholder present
+				}
+				await (super.rmdir as (p: string) => Promise<any>)(path);
 			}
 
 			/**
