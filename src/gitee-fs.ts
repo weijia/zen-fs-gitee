@@ -26,7 +26,7 @@ function diagLog(...args: unknown[]): void {
   }
 }
 import type { GiteeOptions } from './types.js';
-import { mtimePathFor, sidecarToDataPath, shaHash, apiPath } from './utils.js';
+import { mtimePathFor, sidecarToDataPath, shaHash, apiPath, isMetadataSidecarToDelete } from './utils.js';
 
 /** TTL (ms) for the negative cache of "path has no .mtime sidecar" — avoids 404 storms. */
 const NO_SIDECAR_TTL_MS = 10 * 60 * 1000;
@@ -312,6 +312,11 @@ export class GiteeFS extends IndexFS {
 				}
 			} catch { /* non-fatal — shouldSync will return true */ }
 		}
+
+		// 7. Delete stale hidden metadata files (fire-and-forget, init latency
+		//    unaffected): single-dot `.version`/`.mtime` sidecars (`.name.mtime`)
+		//    AND any `..`-prefixed file. Detection is OR, never AND.
+		void this.deleteMetadataSidecars().catch(() => {});
 
 		this.initialized = true;
 	}
@@ -921,9 +926,13 @@ export class GiteeFS extends IndexFS {
 			// sidecarToDataPath() returns non-null only for `.filename.mtime`
 			// files, so it doubles as a reliable sidecar detector (unlike
 			// isMtimeSidecar(item.path), which fails on directory-prefixed paths).
+			// Dot-prefixed metadata sidecars (`.name.mtime` / `.name.version`) use
+			// a different data-path mapping and are NOT included here — they are
+			// handled by the dot-meta prune pass below.
 			const sidecarByData = new Map<string, string>();
 			for (const item of tree) {
 				if (item.type === 'tree') continue;
+				if (isMetadataSidecarToDelete(item.path)) continue;
 				const dataPath = sidecarToDataPath(item.path);
 				if (dataPath) sidecarByData.set('/' + dataPath, '/' + item.path);
 			}
@@ -1000,18 +1009,31 @@ export class GiteeFS extends IndexFS {
 				});
 			}
 
-			// Dynamic cleanup: delete orphaned `.mtime` sidecars (a sidecar whose
-			// data file no longer exists in the repo). Detection reuses this tree,
+			// Dynamic cleanup: delete metadata sidecars. Detection reuses this tree,
 			// so no extra API call. Best-effort; failures are logged and ignored.
+			//
+			// Two distinct deletion families (OR, never AND — see
+			// isMetadataSidecarToDelete):
+			//  - suffix-style `.mtime`   → deleted only when orphaned (data file
+			//                              gone), via sidecarToDataPath mapping.
+			//  - single-dot `.name.mtime` / `.name.version` sidecars AND any
+			//    `..`-prefixed file (`..name`, `..name.mtime`, ...) → deleted
+			//    UNCONDITIONALLY (all of them), per request (stale hidden metadata).
 			const allDataPaths = new Set<string>();
-			const sidecarItems: { path: string; sha: string }[] = [];
+			const suffixSidecars: { path: string; sha: string }[] = [];
+			const metadataSidecars: { path: string; sha: string }[] = [];
 			for (const item of tree) {
 				if (item.type === 'tree') continue;
-				const dataPath = sidecarToDataPath(item.path);
-				if (dataPath) sidecarItems.push({ path: item.path, sha: item.sha });
-				else allDataPaths.add(item.path);
+				if (isMetadataSidecarToDelete(item.path)) {
+					metadataSidecars.push({ path: item.path, sha: item.sha });
+				} else {
+					const dataPath = sidecarToDataPath(item.path);
+					if (dataPath) suffixSidecars.push({ path: item.path, sha: item.sha });
+					else allDataPaths.add(item.path);
+				}
 			}
-			for (const sc of sidecarItems) {
+			// Suffix-style `.mtime` sidecars.
+			for (const sc of suffixSidecars) {
 				const dataPath = sidecarToDataPath(sc.path)!;
 				const orphaned = sc.path.endsWith('.mtime.mtime') || !allDataPaths.has(dataPath);
 				if (!orphaned) continue;
@@ -1021,6 +1043,18 @@ export class GiteeFS extends IndexFS {
 					void this.api.deleteFile(full, sc.sha, `Prune orphaned mtime sidecar ${full}`)
 						.then(() => { this.shaCache.delete(full); this._deleteSha(full); })
 						.catch((e) => log.warn(`createSnapshot: failed to prune ${full}:`, e));
+				}
+			}
+			// Single-dot `.version`/`.mtime` sidecars AND any `..`-prefixed file
+			// (collected above via isMetadataSidecarToDelete). Per request: delete
+			// ALL of them unconditionally — they are stale hidden metadata.
+			for (const sc of metadataSidecars) {
+				const full = '/' + sc.path;
+				log.warn(`createSnapshot: deleting stale dotfile ${full}`);
+				if (typeof this.api.deleteFile === 'function') {
+					void this.api.deleteFile(full, sc.sha, `Delete stale dotfile ${full}`)
+						.then(() => { this.shaCache.delete(full); this._deleteSha(full); })
+						.catch((e) => log.warn(`createSnapshot: failed to delete ${full}:`, e));
 				}
 			}
 
@@ -1046,6 +1080,11 @@ export class GiteeFS extends IndexFS {
 			const sidecarItems: { path: string; sha: string }[] = [];
 			for (const item of tree) {
 				if (item.type === 'tree') continue;
+				// Single-dot `.version`/`.mtime` sidecars AND any `..`-prefixed file
+				// are deleted by {@link deleteMetadataSidecars} (and on the fly in
+				// init/createSnapshot), so skip them here to avoid mis-mapping
+				// (`.note.json.mtime` would wrongly resolve to `.note.json`).
+				if (isMetadataSidecarToDelete(item.path)) continue;
 				const dataPath = sidecarToDataPath(item.path);
 				if (dataPath) sidecarItems.push({ path: item.path, sha: item.sha });
 				else allDataPaths.add(item.path);
@@ -1064,6 +1103,39 @@ export class GiteeFS extends IndexFS {
 					removed++;
 				} catch (e) {
 					log.warn(`pruneOrphanedMtimeSidecars: failed to delete ${full}:`, e);
+				}
+			}
+			return removed;
+			}
+
+			/**
+			* Delete stale hidden metadata files in the Gitee repo, unconditionally:
+			*  - single-dot `.version`/`.mtime` sidecars (`.name.mtime` / `.name.version`)
+			*  - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+			* Detection is OR, never AND (see {@link isMetadataSidecarToDelete}).
+			* Returns the number of files removed. Safe to call at any time; each
+			* deletion is best-effort.
+			*
+			* NOTE: `init()` and `createSnapshot()` already delete these sidecars on
+			* the fly during normal operation; this method forces an explicit,
+			* on-demand full cleanup (e.g. from a maintenance task).
+			*/
+			async deleteMetadataSidecars(root: string = '/'): Promise<number> {
+			const normalizedRoot = root === '/' ? '' : root.replace(/^\/+|\/+$/g, '');
+			const tree = await this.api.getTree(true);
+			let removed = 0;
+			for (const item of tree) {
+				if (item.type === 'tree') continue;
+				if (normalizedRoot && item.path !== normalizedRoot && !item.path.startsWith(normalizedRoot + '/')) continue;
+				if (!isMetadataSidecarToDelete(item.path)) continue;
+				const full = '/' + item.path;
+				try {
+					await this.api.deleteFile(full, item.sha, `Delete dot-meta sidecar ${full}`);
+					this.shaCache.delete(full);
+					this._deleteSha(full);
+					removed++;
+				} catch (e) {
+					log.warn(`deleteMetadataSidecars: failed to delete ${full}:`, e);
 				}
 			}
 			return removed;
