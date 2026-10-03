@@ -26,7 +26,7 @@ function diagLog(...args) {
         /* ignore */
     }
 }
-import { mtimePathFor, sidecarToDataPath, shaHash } from './utils.js';
+import { mtimePathFor, sidecarToDataPath, shaHash, isMetadataSidecarToDelete, bytesEqual } from './utils.js';
 /** TTL (ms) for the negative cache of "path has no .mtime sidecar" — avoids 404 storms. */
 const NO_SIDECAR_TTL_MS = 10 * 60 * 1000;
 /**
@@ -270,6 +270,11 @@ export class GiteeFS extends IndexFS {
             }
             catch { /* non-fatal — shouldSync will return true */ }
         }
+        // 7. Delete stale hidden metadata files (fire-and-forget, init latency
+        //    unaffected): single-dot `.version`/`.mtime` sidecars (`.name.mtime`)
+        //    AND any `..`-prefixed file. Detection is OR, never AND. Reuse the
+        //    tree already fetched in step 2 — no extra getTree API call.
+        void this.deleteMetadataSidecars('/', tree).catch(() => { });
         this.initialized = true;
     }
     /**
@@ -433,7 +438,10 @@ export class GiteeFS extends IndexFS {
     }
     // --- Write ---
     async write(path, data, offset, mtimeMs) {
-        let existing = this.contentCache.get(path) || new Uint8Array(0);
+        // Capture the previously cached content BEFORE we overwrite it — it is the
+        // remote's current content, used to detect "content unchanged" below.
+        const previous = this.contentCache.get(path);
+        let existing = previous || new Uint8Array(0);
         const newSize = Math.max(existing.length, offset + data.length);
         const merged = new Uint8Array(newSize);
         merged.set(existing);
@@ -442,8 +450,6 @@ export class GiteeFS extends IndexFS {
         const writeContent = merged.length === 0
             ? new TextEncoder().encode('\n')
             : merged;
-        this.contentCache.set(path, writeContent);
-        this._persistContent(path, writeContent);
         // Preserve the source's real mtime (fall back to now). Without this the
         // target mtime would be lost and stat() would fall back to the commit
         // time, making the sync engine re-PUT content-identical files every
@@ -455,21 +461,32 @@ export class GiteeFS extends IndexFS {
         }
         const sha = this.shaCache.get(path);
         if (sha) {
-            const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
-            this.shaCache.set(path, newSha);
-            this._persistSha(path, newSha);
+            // Content unchanged (only mtime differs) → skip re-writing the data
+            // file so we don't create a pointless commit. The sidecar below
+            // still updates the real mtime. Compare against `previous` (the
+            // cached remote content), NOT the freshly-merged buffer. See DESIGN.md §4.
+            if (!(previous && bytesEqual(previous, writeContent))) {
+                const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
+                this.shaCache.set(path, newSha);
+                this._persistSha(path, newSha);
+            }
         }
         else {
             const newSha = await this.api.createFile(path, writeContent, `Create ${path}`);
             this.shaCache.set(path, newSha);
             this._persistSha(path, newSha);
         }
+        this.contentCache.set(path, writeContent);
+        this._persistContent(path, writeContent);
         // Write the .mtime sidecar so cross-backend sync can compare the real
         // modification time instead of the Gitee commit time.
         await this.writeMtimeSidecar(path, effectiveMtime);
     }
     writeSync(path, data, offset, mtimeMs) {
-        let existing = this.contentCache.get(path) || new Uint8Array(0);
+        // Capture the previously cached content BEFORE we overwrite it — it is the
+        // remote's current content, used to detect "content unchanged" below.
+        const previous = this.contentCache.get(path);
+        let existing = previous || new Uint8Array(0);
         const newSize = Math.max(existing.length, offset + data.length);
         const merged = new Uint8Array(newSize);
         merged.set(existing);
@@ -487,13 +504,18 @@ export class GiteeFS extends IndexFS {
             inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
         }
         const sha = this.shaCache.get(path);
-        this._queue((sha
-            ? this.api.updateFile(path, writeContent, sha, `Update ${path}`)
-            : this.api.createFile(path, writeContent, `Create ${path}`))
-            .then((newSha) => {
+        this._queue((async () => {
+            // Content unchanged (only mtime differs) → skip the data-file API
+            // write entirely (no pointless commit). Compare against `previous`
+            // (the cached remote content), not the freshly-merged buffer. See DESIGN.md §4.
+            if (sha && previous && bytesEqual(previous, writeContent))
+                return;
+            const newSha = sha
+                ? await this.api.updateFile(path, writeContent, sha, `Update ${path}`)
+                : await this.api.createFile(path, writeContent, `Create ${path}`);
             this.shaCache.set(path, newSha);
             this._persistSha(path, newSha);
-        })
+        })()
             .catch(() => { }));
         // Write the .mtime sidecar (queued, fire-and-forget) — see DESIGN.md §4.
         this.writeMtimeSidecarSync(path, effectiveMtime);
@@ -730,20 +752,32 @@ export class GiteeFS extends IndexFS {
         // Build sidecar content (mtimeMs as string)
         const sidecarPath = mtimePathFor(path);
         const sidecarContent = new TextEncoder().encode(String(mtimeMs));
-        // 1. Write data file via Contents API
+        // 1. Write data file via Contents API — but ONLY when the content
+        //    actually changed. If the content is byte-identical to what's
+        //    already on the remote (only the mtime differs), skip the data-file
+        //    write entirely so we don't create a pointless "content-identical"
+        //    commit every sync cycle (see DESIGN.md §4 / docs FR-6). The real
+        //    mtime is still carried by the sidecar written in step 2.
+        const contentUnchanged = await this.isContentUnchanged(path, content);
         const existingDataSha = this.shaCache.get(path);
         let newDataSha;
-        if (existingDataSha) {
-            newDataSha = await this.api.updateFile(path, content, existingDataSha, `Update ${path} (mtime=${mtimeMs})`);
+        // Skip the data write only when the content is unchanged AND the file
+        // already exists remotely (shaCache has its blob SHA). A brand-new file
+        // with a coincidentally-cached identical buffer must still be created.
+        if (!contentUnchanged || !existingDataSha) {
+            newDataSha = existingDataSha
+                ? await this.api.updateFile(path, content, existingDataSha, `Update ${path} (mtime=${mtimeMs})`)
+                : await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
         }
-        else {
-            newDataSha = await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
-        }
-        // 3. Only after the data API call succeeds, update local caches
+        // 3. Only after the data API call succeeds, update local caches.
+        //    When content is unchanged we keep the existing blob SHA (no rewrite
+        //    happened) and just refresh the cached content.
         this.contentCache.set(path, content);
         this._persistContent(path, content);
-        this.shaCache.set(path, newDataSha);
-        this._persistSha(path, newDataSha);
+        if (newDataSha) {
+            this.shaCache.set(path, newDataSha);
+            this._persistSha(path, newDataSha);
+        }
         // 2. Write sidecar file via Contents API — but never nest: if `path` is
         //    itself a `.mtime` sidecar, skip the sidecar write (otherwise we'd
         //    create `.file.mtime.mtime`). Mirrors the guard in writeMtimeSidecar().
@@ -784,6 +818,45 @@ export class GiteeFS extends IndexFS {
         }
         diagLog('writeFileWithMtime DONE', path, 'mtimeMs=', mtimeMs, 'mtimeCache.fromSidecar=', this.mtimeCache.get(path)?.fromSidecar, 'noSidecarCache.has=', this.noSidecarCache.has(path));
     }
+    /**
+     * True when `content` is byte-identical to the file's currently cached remote
+     * content.
+     *
+     * Used to skip re-writing the data file (and its commit) when only the mtime
+     * changed — see {@link writeFileWithMtime} / {@link write}. This is a pure
+     * in-memory check (zero network): in a normal sync the data content is
+     * already cached by `preloadContents()` / `read()` before `writeFileWithMtime`
+     * is called, so the comparison is reliable. On a cache miss we return `false`
+     * (assume changed → write the data file) rather than fetching, which keeps
+     * behaviour predictable and avoids an extra read on every write.
+     */
+    isContentUnchanged(path, content) {
+        const cached = this.contentCache.get(path);
+        if (!cached)
+            return false;
+        return bytesEqual(cached, content);
+    }
+    /**
+     * Return a legitimate, cached mtime (ms) for a file without re-querying the
+     * API, or `undefined` if one must be fetched. Mirrors `stat()`'s trust rules:
+     * a sidecar-derived value (fromSidecar:true) is always trusted while the SHA
+     * is unchanged; a commit-time value (fromSidecar:false) is trusted only
+     * within the negative-sidecar window (we've confirmed no sidecar exists for
+     * this path). Returns undefined otherwise so the caller re-fetches via the
+     * Commits API (a sidecar written later would otherwise be missed).
+     */
+    _cachedLegitMtime(fullPath, sha) {
+        const cached = this.mtimeCache.get(fullPath);
+        if (!cached || cached.sha !== sha)
+            return undefined;
+        if (cached.fromSidecar)
+            return new Date(cached.lastModified).getTime();
+        const neg = this.noSidecarCache.get(fullPath);
+        if (neg !== undefined && Date.now() - neg <= NO_SIDECAR_TTL_MS) {
+            return new Date(cached.lastModified).getTime();
+        }
+        return undefined;
+    }
     // -----------------------------------------------------------------------
     // createSnapshot — efficient snapshot using Git tree API
     // -----------------------------------------------------------------------
@@ -797,11 +870,13 @@ export class GiteeFS extends IndexFS {
      * mtimeMs is taken from the `.mtime` sidecar when available (the real
      * modification time preserved across sync — see DESIGN.md §4), so the
      * target-side mtime stays comparable with the source's real mtime. When a
-     * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
-     * as a content-stable proxy — different content produces a different SHA,
-     * which the sync engine detects as a change, and which is more reliable
-     * than commit timestamps (only second-level precision, shared across files
-     * committed together).
+     * file has no sidecar (legacy writes), it falls back to the file's last
+     * commit time from the Commits API (`getLastCommit`) — a real timestamp,
+     * cached in mtimeCache (fromSidecar:false) and amortized across cycles via
+     * the noSidecarCache negative window. Commit time has only second-level
+     * precision and is shared across files committed together, but it is a
+     * legitimate mtime (unlike a content hash) and is superseded by the real
+     * sidecar mtime once the file is re-written.
      *
      * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
      * don't appear as user-visible files.
@@ -817,18 +892,30 @@ export class GiteeFS extends IndexFS {
             // sidecarToDataPath() returns non-null only for `.filename.mtime`
             // files, so it doubles as a reliable sidecar detector (unlike
             // isMtimeSidecar(item.path), which fails on directory-prefixed paths).
+            // Dot-prefixed metadata sidecars (`.name.mtime` / `.name.version`) use
+            // a different data-path mapping and are NOT included here — they are
+            // handled by the dot-meta prune pass below.
             const sidecarByData = new Map();
             for (const item of tree) {
                 if (item.type === 'tree')
+                    continue;
+                if (isMetadataSidecarToDelete(item.path))
                     continue;
                 const dataPath = sidecarToDataPath(item.path);
                 if (dataPath)
                     sidecarByData.set('/' + dataPath, '/' + item.path);
             }
-            // Second pass: build snapshot for real data files.
+            const snapEntries = [];
+            const needCommitMtime = [];
             for (const item of tree) {
                 // Skip directories
                 if (item.type === 'tree')
+                    continue;
+                // Skip the internal `.keep` placeholder — it only keeps otherwise-empty
+                // directories alive in Git and is not a user file. Hidden from callers
+                // per the backend contract (zen-fs-sync/docs/SyncableFS.md §1/§2).
+                const _keepBase = item.path.slice(item.path.lastIndexOf('/') + 1);
+                if (_keepBase === '.keep')
                     continue;
                 // Skip mtime sidecar files (internal metadata) — also excludes
                 // them from appearing as user-visible files.
@@ -859,27 +946,26 @@ export class GiteeFS extends IndexFS {
                             continue;
                     }
                 }
-                // Default mtime proxy (used only when no real-mtime sidecar is
-                // available). shaHash(blobSha) is stable per content and avoids
-                // the second-level precision issues of commit timestamps.
-                const mtimeMsProxy = shaHash(item.sha);
-                // Prefer the real mtime preserved in the `.mtime` sidecar. This
+                const entry = { relPath, size: item.size || 0, fullPath, itemPath: item.path, sha: item.sha, mtimeMs: 0 };
+                // 1. Prefer the real mtime preserved in the `.mtime` sidecar. This
                 // keeps target-side mtime comparable with the source's real
-                // modification time (see DESIGN.md §4) instead of a content hash.
-                let mtimeMs = mtimeMsProxy;
+                // modification time (see DESIGN.md §4).
+                let resolved = false;
                 const sidecarPath = sidecarByData.get(fullPath);
                 if (sidecarPath) {
                     const cached = this.contentCache.get(sidecarPath);
                     if (cached) {
-                        const mtimeStr = new TextDecoder().decode(cached).trim();
-                        const parsed = Number(mtimeStr);
-                        if (!isNaN(parsed) && parsed > 0)
-                            mtimeMs = parsed;
+                        const parsed = Number(new TextDecoder().decode(cached).trim());
+                        if (!isNaN(parsed) && parsed > 0) {
+                            entry.mtimeMs = parsed;
+                            resolved = true;
+                        }
                     }
                     else if (this.shaCache.has(sidecarPath)) {
                         // Sidecar exists remotely but its content isn't cached yet
                         // (e.g. pulled from remote without a prior stat). Fire-and-forget
-                        // a fetch so the NEXT snapshot cycle gets the real value.
+                        // a fetch so the NEXT snapshot cycle gets the real value, and
+                        // fall back to the legitimate commit time (below) for THIS cycle.
                         void this.api.getRaw(sidecarPath).then((raw) => {
                             const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
                             this.contentCache.set(sidecarPath, bytes);
@@ -887,27 +973,72 @@ export class GiteeFS extends IndexFS {
                         }).catch(() => { });
                     }
                 }
-                snapshot.set(relPath, {
-                    path: relPath,
-                    size: item.size || 0,
-                    mtimeMs,
-                });
+                // 2/3. Legitimate commit time (cached or fetched via Commits API).
+                if (!resolved) {
+                    const cachedMtime = this._cachedLegitMtime(fullPath, item.sha);
+                    if (cachedMtime !== undefined) {
+                        entry.mtimeMs = cachedMtime;
+                    }
+                    else {
+                        needCommitMtime.push({ fullPath, itemPath: item.path, sha: item.sha, entry });
+                    }
+                }
+                snapEntries.push(entry);
             }
-            // Dynamic cleanup: delete orphaned `.mtime` sidecars (a sidecar whose
-            // data file no longer exists in the repo). Detection reuses this tree,
+            // Resolve commit times in parallel (one extra round of API calls, amortized
+            // by mtimeCache + noSidecarCache across cycles — see stat() step 3).
+            if (needCommitMtime.length) {
+                await Promise.all(needCommitMtime.map(async (p) => {
+                    const commit = await this.api.getLastCommit(p.itemPath).catch(() => null);
+                    if (commit) {
+                        p.entry.mtimeMs = new Date(commit.date).getTime();
+                        const mtimeEntry = { sha: p.sha, lastModified: commit.date, fromSidecar: false };
+                        this.mtimeCache.set(p.fullPath, mtimeEntry);
+                        this._persistMtime(p.fullPath, mtimeEntry);
+                        this.noSidecarCache.set(p.fullPath, Date.now());
+                    }
+                    else {
+                        // Commits API unreachable although the tree loaded: keep the
+                        // snapshot buildable with a previously persisted value, or as a
+                        // last resort a content hash (anomalous path — tree success but
+                        // commits endpoint failure is rare).
+                        const prev = this.mtimeCache.get(p.fullPath);
+                        p.entry.mtimeMs = prev ? new Date(prev.lastModified).getTime() : shaHash(p.sha);
+                    }
+                }));
+            }
+            for (const e of snapEntries) {
+                snapshot.set(e.relPath, { path: e.relPath, size: e.size, mtimeMs: e.mtimeMs });
+            }
+            // Dynamic cleanup: delete metadata sidecars. Detection reuses this tree,
             // so no extra API call. Best-effort; failures are logged and ignored.
+            //
+            // Two distinct deletion families (OR, never AND — see
+            // isMetadataSidecarToDelete):
+            //  - suffix-style `.mtime`   → deleted only when orphaned (data file
+            //                              gone), via sidecarToDataPath mapping.
+            //  - single-dot `.name.mtime` / `.name.version` sidecars AND any
+            //    `..`-prefixed file (`..name`, `..name.mtime`, ...) → deleted
+            //    UNCONDITIONALLY (all of them), per request (stale hidden metadata).
             const allDataPaths = new Set();
-            const sidecarItems = [];
+            const suffixSidecars = [];
+            const metadataSidecars = [];
             for (const item of tree) {
                 if (item.type === 'tree')
                     continue;
-                const dataPath = sidecarToDataPath(item.path);
-                if (dataPath)
-                    sidecarItems.push({ path: item.path, sha: item.sha });
-                else
-                    allDataPaths.add(item.path);
+                if (isMetadataSidecarToDelete(item.path)) {
+                    metadataSidecars.push({ path: item.path, sha: item.sha });
+                }
+                else {
+                    const dataPath = sidecarToDataPath(item.path);
+                    if (dataPath)
+                        suffixSidecars.push({ path: item.path, sha: item.sha });
+                    else
+                        allDataPaths.add(item.path);
+                }
             }
-            for (const sc of sidecarItems) {
+            // Suffix-style `.mtime` sidecars.
+            for (const sc of suffixSidecars) {
                 const dataPath = sidecarToDataPath(sc.path);
                 const orphaned = sc.path.endsWith('.mtime.mtime') || !allDataPaths.has(dataPath);
                 if (!orphaned)
@@ -920,12 +1051,69 @@ export class GiteeFS extends IndexFS {
                         .catch((e) => log.warn(`createSnapshot: failed to prune ${full}:`, e));
                 }
             }
+            // Single-dot `.version`/`.mtime` sidecars AND any `..`-prefixed file
+            // (collected above via isMetadataSidecarToDelete). Per request: delete
+            // ALL of them unconditionally — they are stale hidden metadata.
+            for (const sc of metadataSidecars) {
+                const full = '/' + sc.path;
+                log.warn(`createSnapshot: deleting stale dotfile ${full}`);
+                if (typeof this.api.deleteFile === 'function') {
+                    void this.api.deleteFile(full, sc.sha, `Delete stale dotfile ${full}`)
+                        .then(() => { this.shaCache.delete(full); this._deleteSha(full); })
+                        .catch((e) => log.warn(`createSnapshot: failed to delete ${full}:`, e));
+                }
+            }
             return snapshot;
         }
         catch (err) {
             log.warn(`createSnapshot failed:`, err);
             return null;
         }
+    }
+    // ---------------------------------------------------------------------
+    // Empty-directory placeholder (`.keep`) handling.
+    //
+    // Git cannot store empty directories, so GiteeFS keeps a directory alive
+    // with an internal `.keep` placeholder — exactly like RemoteStorage. Per
+    // the backend contract (zen-fs-sync/docs/SyncableFS.md §1/§2) this
+    // placeholder is an internal implementation file that MUST be hidden from
+    // callers, while empty directories are preserved by the sync engine
+    // calling mkdir on the target (not by syncing the placeholder).
+    // ---------------------------------------------------------------------
+    async readdir(path) {
+        const names = await super.readdir(path);
+        return names.filter((n) => n !== '.keep');
+    }
+    async mkdir(path, options) {
+        // The base IndexFS.mkdir does `options.mode |= S_IFDIR`, so it
+        // requires a defined options object. Default it for callers that
+        // pass none (e.g. `mkdir('/dir')`).
+        const opts = options ?? { mode: S_IFDIR | 0o755 };
+        const result = await super.mkdir(path, opts);
+        // Create an internal `.keep` placeholder so the (otherwise empty)
+        // directory survives in Git. Content is `\n` (matches Gitee's
+        // historical placeholder). Hidden by readdir() above.
+        const keepPath = `${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`;
+        try {
+            if (!(await this.exists(keepPath))) {
+                await this.writeFile(keepPath, '\n');
+            }
+        }
+        catch {
+            // best-effort; directory entry already recorded by super.mkdir
+        }
+        return result;
+    }
+    async rmdir(path) {
+        // Remove the internal `.keep` first so the directory is empty before
+        // the base class removes its entry.
+        try {
+            await super.unlink(`${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`);
+        }
+        catch {
+            // no placeholder present
+        }
+        await super.rmdir(path);
     }
     /**
     * Recursively delete `.mtime` sidecar files whose data file no longer
@@ -942,6 +1130,12 @@ export class GiteeFS extends IndexFS {
         const sidecarItems = [];
         for (const item of tree) {
             if (item.type === 'tree')
+                continue;
+            // Single-dot `.version`/`.mtime` sidecars AND any `..`-prefixed file
+            // are deleted by {@link deleteMetadataSidecars} (and on the fly in
+            // init/createSnapshot), so skip them here to avoid mis-mapping
+            // (`.note.json.mtime` would wrongly resolve to `.note.json`).
+            if (isMetadataSidecarToDelete(item.path))
                 continue;
             const dataPath = sidecarToDataPath(item.path);
             if (dataPath)
@@ -966,6 +1160,44 @@ export class GiteeFS extends IndexFS {
             }
             catch (e) {
                 log.warn(`pruneOrphanedMtimeSidecars: failed to delete ${full}:`, e);
+            }
+        }
+        return removed;
+    }
+    /**
+    * Delete stale hidden metadata files in the Gitee repo, unconditionally:
+    *  - single-dot `.version`/`.mtime` sidecars (`.name.mtime` / `.name.version`)
+    *  - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+    * Detection is OR, never AND (see {@link isMetadataSidecarToDelete}).
+    * Returns the number of files removed. Safe to call at any time; each
+    * deletion is best-effort.
+    *
+    * NOTE: `init()` and `createSnapshot()` already delete these sidecars on
+    * the fly during normal operation; this method forces an explicit,
+    * on-demand full cleanup (e.g. from a maintenance task).
+    */
+    async deleteMetadataSidecars(root = '/', preloadedTree) {
+        const normalizedRoot = root === '/' ? '' : root.replace(/^\/+|\/+$/g, '');
+        // Reuse the tree already fetched by init()/createSnapshot() when
+        // available so we don't burn an extra getTree API call on every mount.
+        const tree = preloadedTree ?? (await this.api.getTree(true));
+        let removed = 0;
+        for (const item of tree) {
+            if (item.type === 'tree')
+                continue;
+            if (normalizedRoot && item.path !== normalizedRoot && !item.path.startsWith(normalizedRoot + '/'))
+                continue;
+            if (!isMetadataSidecarToDelete(item.path))
+                continue;
+            const full = '/' + item.path;
+            try {
+                await this.api.deleteFile(full, item.sha, `Delete dot-meta sidecar ${full}`);
+                this.shaCache.delete(full);
+                this._deleteSha(full);
+                removed++;
+            }
+            catch (e) {
+                log.warn(`deleteMetadataSidecars: failed to delete ${full}:`, e);
             }
         }
         return removed;

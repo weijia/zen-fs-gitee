@@ -44,8 +44,37 @@ export declare function isMtimeSidecar(name: string): boolean;
  */
 export declare function sidecarToDataPath(sidecarPath: string): string | null;
 /**
+ * Byte-for-byte equality of two Uint8Arrays.
+ * Used to detect content-identical writes so the data file (and its commit)
+ * can be skipped while only the `.mtime` sidecar is updated.
+ */
+export declare function bytesEqual(a: Uint8Array, b: Uint8Array): boolean;
+/**
  * Hash a blob SHA to a numeric value for use as mtimeMs proxy.
  * Different content → different SHA → different hash → detected as change.
  */
 export declare function shaHash(sha: string): number;
+/**
+ * Suffixes that mark a dotfile as a metadata sidecar eligible for auto-cleanup.
+ */
+export declare const DOT_META_SUFFIXES: readonly [".mtime", ".version"];
+/**
+ * Case 1 — single-dot metadata sidecar: name starts with '.' and contains one
+ * of {@link DOT_META_SUFFIXES} (`.mtime` / `.version`), e.g. `.note.json.mtime`.
+ * (`..note.json.mtime` also matches here, but is additionally covered by
+ * {@link isDoubleDotFile} — see {@link isMetadataSidecarToDelete}.)
+ */
+export declare function isDotMetaSidecar(name: string): boolean;
+/**
+ * Case 2 — double-dot file: ANY name that starts with `..`, regardless of
+ * whether it carries a `.version`/`.mtime` marker. These are deleted wholesale
+ * (e.g. `..tmp`, `..note.json.mtime`).
+ */
+export declare function isDoubleDotFile(name: string): boolean;
+/**
+ * Files that should be auto-deleted: EITHER deletion case above (OR, never
+ * AND). A file matches if it is a single-dot `.version`/`.mtime` sidecar OR any
+ * `..`-prefixed file. Used by `init()` / `createSnapshot()` cleanup.
+ */
+export declare function isMetadataSidecarToDelete(name: string): boolean;
 //# sourceMappingURL=utils.d.ts.map

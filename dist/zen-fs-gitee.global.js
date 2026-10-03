@@ -18565,12 +18565,30 @@ var ZenFSGitee = (() => {
     if (dataFilename === "") return null;
     return `${dir}${dataFilename}`;
   }
+  function bytesEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
   function shaHash(sha) {
     let hash = 0;
     for (let i = 0; i < sha.length; i++) {
       hash = (hash << 5) - hash + sha.charCodeAt(i) | 0;
     }
     return Math.abs(hash);
+  }
+  var DOT_META_SUFFIXES = [".mtime", ".version"];
+  function isDotMetaSidecar(name) {
+    if (!name.startsWith(".")) return false;
+    return DOT_META_SUFFIXES.some((s) => name.includes(s));
+  }
+  function isDoubleDotFile(name) {
+    return name.startsWith("..");
+  }
+  function isMetadataSidecarToDelete(name) {
+    return isDotMetaSidecar(name) || isDoubleDotFile(name);
   }
 
   // node_modules/@richard432/localstorage-logger/dist/index.mjs
@@ -19107,6 +19125,8 @@ var ZenFSGitee = (() => {
         } catch {
         }
       }
+      void this.deleteMetadataSidecars("/", tree).catch(() => {
+      });
       this.initialized = true;
     }
     /**
@@ -19246,14 +19266,13 @@ var ZenFSGitee = (() => {
     }
     // --- Write ---
     async write(path, data, offset, mtimeMs) {
-      let existing = this.contentCache.get(path) || new Uint8Array(0);
+      const previous = this.contentCache.get(path);
+      let existing = previous || new Uint8Array(0);
       const newSize = Math.max(existing.length, offset + data.length);
       const merged = new Uint8Array(newSize);
       merged.set(existing);
       merged.set(data, offset);
       const writeContent = merged.length === 0 ? new TextEncoder().encode("\n") : merged;
-      this.contentCache.set(path, writeContent);
-      this._persistContent(path, writeContent);
       const effectiveMtime = mtimeMs ?? Date.now();
       const inode = this.index.get(path);
       if (inode) {
@@ -19261,18 +19280,23 @@ var ZenFSGitee = (() => {
       }
       const sha = this.shaCache.get(path);
       if (sha) {
-        const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
-        this.shaCache.set(path, newSha);
-        this._persistSha(path, newSha);
+        if (!(previous && bytesEqual(previous, writeContent))) {
+          const newSha = await this.api.updateFile(path, writeContent, sha, `Update ${path}`);
+          this.shaCache.set(path, newSha);
+          this._persistSha(path, newSha);
+        }
       } else {
         const newSha = await this.api.createFile(path, writeContent, `Create ${path}`);
         this.shaCache.set(path, newSha);
         this._persistSha(path, newSha);
       }
+      this.contentCache.set(path, writeContent);
+      this._persistContent(path, writeContent);
       await this.writeMtimeSidecar(path, effectiveMtime);
     }
     writeSync(path, data, offset, mtimeMs) {
-      let existing = this.contentCache.get(path) || new Uint8Array(0);
+      const previous = this.contentCache.get(path);
+      let existing = previous || new Uint8Array(0);
       const newSize = Math.max(existing.length, offset + data.length);
       const merged = new Uint8Array(newSize);
       merged.set(existing);
@@ -19287,10 +19311,12 @@ var ZenFSGitee = (() => {
       }
       const sha = this.shaCache.get(path);
       this._queue(
-        (sha ? this.api.updateFile(path, writeContent, sha, `Update ${path}`) : this.api.createFile(path, writeContent, `Create ${path}`)).then((newSha) => {
+        (async () => {
+          if (sha && previous && bytesEqual(previous, writeContent)) return;
+          const newSha = sha ? await this.api.updateFile(path, writeContent, sha, `Update ${path}`) : await this.api.createFile(path, writeContent, `Create ${path}`);
           this.shaCache.set(path, newSha);
           this._persistSha(path, newSha);
-        }).catch(() => {
+        })().catch(() => {
         })
       );
       this.writeMtimeSidecarSync(path, effectiveMtime);
@@ -19467,17 +19493,18 @@ var ZenFSGitee = (() => {
       }
       const sidecarPath = mtimePathFor(path);
       const sidecarContent = new TextEncoder().encode(String(mtimeMs));
+      const contentUnchanged = await this.isContentUnchanged(path, content);
       const existingDataSha = this.shaCache.get(path);
       let newDataSha;
-      if (existingDataSha) {
-        newDataSha = await this.api.updateFile(path, content, existingDataSha, `Update ${path} (mtime=${mtimeMs})`);
-      } else {
-        newDataSha = await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
+      if (!contentUnchanged || !existingDataSha) {
+        newDataSha = existingDataSha ? await this.api.updateFile(path, content, existingDataSha, `Update ${path} (mtime=${mtimeMs})`) : await this.api.createFile(path, content, `Create ${path} (mtime=${mtimeMs})`);
       }
       this.contentCache.set(path, content);
       this._persistContent(path, content);
-      this.shaCache.set(path, newDataSha);
-      this._persistSha(path, newDataSha);
+      if (newDataSha) {
+        this.shaCache.set(path, newDataSha);
+        this._persistSha(path, newDataSha);
+      }
       if (sidecarToDataPath(path) === null) {
         const existingSidecarSha = this.shaCache.get(sidecarPath);
         let newSidecarSha;
@@ -19515,6 +19542,42 @@ var ZenFSGitee = (() => {
         this.noSidecarCache.has(path)
       );
     }
+    /**
+     * True when `content` is byte-identical to the file's currently cached remote
+     * content.
+     *
+     * Used to skip re-writing the data file (and its commit) when only the mtime
+     * changed — see {@link writeFileWithMtime} / {@link write}. This is a pure
+     * in-memory check (zero network): in a normal sync the data content is
+     * already cached by `preloadContents()` / `read()` before `writeFileWithMtime`
+     * is called, so the comparison is reliable. On a cache miss we return `false`
+     * (assume changed → write the data file) rather than fetching, which keeps
+     * behaviour predictable and avoids an extra read on every write.
+     */
+    isContentUnchanged(path, content) {
+      const cached = this.contentCache.get(path);
+      if (!cached) return false;
+      return bytesEqual(cached, content);
+    }
+    /**
+     * Return a legitimate, cached mtime (ms) for a file without re-querying the
+     * API, or `undefined` if one must be fetched. Mirrors `stat()`'s trust rules:
+     * a sidecar-derived value (fromSidecar:true) is always trusted while the SHA
+     * is unchanged; a commit-time value (fromSidecar:false) is trusted only
+     * within the negative-sidecar window (we've confirmed no sidecar exists for
+     * this path). Returns undefined otherwise so the caller re-fetches via the
+     * Commits API (a sidecar written later would otherwise be missed).
+     */
+    _cachedLegitMtime(fullPath, sha) {
+      const cached = this.mtimeCache.get(fullPath);
+      if (!cached || cached.sha !== sha) return void 0;
+      if (cached.fromSidecar) return new Date(cached.lastModified).getTime();
+      const neg = this.noSidecarCache.get(fullPath);
+      if (neg !== void 0 && Date.now() - neg <= NO_SIDECAR_TTL_MS) {
+        return new Date(cached.lastModified).getTime();
+      }
+      return void 0;
+    }
     // -----------------------------------------------------------------------
     // createSnapshot — efficient snapshot using Git tree API
     // -----------------------------------------------------------------------
@@ -19528,11 +19591,13 @@ var ZenFSGitee = (() => {
      * mtimeMs is taken from the `.mtime` sidecar when available (the real
      * modification time preserved across sync — see DESIGN.md §4), so the
      * target-side mtime stays comparable with the source's real mtime. When a
-     * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
-     * as a content-stable proxy — different content produces a different SHA,
-     * which the sync engine detects as a change, and which is more reliable
-     * than commit timestamps (only second-level precision, shared across files
-     * committed together).
+     * file has no sidecar (legacy writes), it falls back to the file's last
+     * commit time from the Commits API (`getLastCommit`) — a real timestamp,
+     * cached in mtimeCache (fromSidecar:false) and amortized across cycles via
+     * the noSidecarCache negative window. Commit time has only second-level
+     * precision and is shared across files committed together, but it is a
+     * legitimate mtime (unlike a content hash) and is superseded by the real
+     * sidecar mtime once the file is re-written.
      *
      * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
      * don't appear as user-visible files.
@@ -19547,11 +19612,16 @@ var ZenFSGitee = (() => {
         const sidecarByData = /* @__PURE__ */ new Map();
         for (const item of tree) {
           if (item.type === "tree") continue;
+          if (isMetadataSidecarToDelete(item.path)) continue;
           const dataPath = sidecarToDataPath(item.path);
           if (dataPath) sidecarByData.set("/" + dataPath, "/" + item.path);
         }
+        const snapEntries = [];
+        const needCommitMtime = [];
         for (const item of tree) {
           if (item.type === "tree") continue;
+          const _keepBase = item.path.slice(item.path.lastIndexOf("/") + 1);
+          if (_keepBase === ".keep") continue;
           if (sidecarToDataPath(item.path)) {
             if (item.path.endsWith(".mtime.mtime")) {
               log3.warn(`createSnapshot: skipping nested mtime sidecar (won't sync): /${item.path}`);
@@ -19570,15 +19640,17 @@ var ZenFSGitee = (() => {
               if (!filter.includePrefixes.some((p) => relPath.startsWith(p))) continue;
             }
           }
-          const mtimeMsProxy = shaHash(item.sha);
-          let mtimeMs = mtimeMsProxy;
+          const entry = { relPath, size: item.size || 0, fullPath, itemPath: item.path, sha: item.sha, mtimeMs: 0 };
+          let resolved = false;
           const sidecarPath = sidecarByData.get(fullPath);
           if (sidecarPath) {
             const cached = this.contentCache.get(sidecarPath);
             if (cached) {
-              const mtimeStr = new TextDecoder().decode(cached).trim();
-              const parsed = Number(mtimeStr);
-              if (!isNaN(parsed) && parsed > 0) mtimeMs = parsed;
+              const parsed = Number(new TextDecoder().decode(cached).trim());
+              if (!isNaN(parsed) && parsed > 0) {
+                entry.mtimeMs = parsed;
+                resolved = true;
+              }
             } else if (this.shaCache.has(sidecarPath)) {
               void this.api.getRaw(sidecarPath).then((raw) => {
                 const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
@@ -19588,21 +19660,48 @@ var ZenFSGitee = (() => {
               });
             }
           }
-          snapshot.set(relPath, {
-            path: relPath,
-            size: item.size || 0,
-            mtimeMs
-          });
+          if (!resolved) {
+            const cachedMtime = this._cachedLegitMtime(fullPath, item.sha);
+            if (cachedMtime !== void 0) {
+              entry.mtimeMs = cachedMtime;
+            } else {
+              needCommitMtime.push({ fullPath, itemPath: item.path, sha: item.sha, entry });
+            }
+          }
+          snapEntries.push(entry);
+        }
+        if (needCommitMtime.length) {
+          await Promise.all(needCommitMtime.map(async (p) => {
+            const commit = await this.api.getLastCommit(p.itemPath).catch(() => null);
+            if (commit) {
+              p.entry.mtimeMs = new Date(commit.date).getTime();
+              const mtimeEntry = { sha: p.sha, lastModified: commit.date, fromSidecar: false };
+              this.mtimeCache.set(p.fullPath, mtimeEntry);
+              this._persistMtime(p.fullPath, mtimeEntry);
+              this.noSidecarCache.set(p.fullPath, Date.now());
+            } else {
+              const prev = this.mtimeCache.get(p.fullPath);
+              p.entry.mtimeMs = prev ? new Date(prev.lastModified).getTime() : shaHash(p.sha);
+            }
+          }));
+        }
+        for (const e of snapEntries) {
+          snapshot.set(e.relPath, { path: e.relPath, size: e.size, mtimeMs: e.mtimeMs });
         }
         const allDataPaths = /* @__PURE__ */ new Set();
-        const sidecarItems = [];
+        const suffixSidecars = [];
+        const metadataSidecars = [];
         for (const item of tree) {
           if (item.type === "tree") continue;
-          const dataPath = sidecarToDataPath(item.path);
-          if (dataPath) sidecarItems.push({ path: item.path, sha: item.sha });
-          else allDataPaths.add(item.path);
+          if (isMetadataSidecarToDelete(item.path)) {
+            metadataSidecars.push({ path: item.path, sha: item.sha });
+          } else {
+            const dataPath = sidecarToDataPath(item.path);
+            if (dataPath) suffixSidecars.push({ path: item.path, sha: item.sha });
+            else allDataPaths.add(item.path);
+          }
         }
-        for (const sc of sidecarItems) {
+        for (const sc of suffixSidecars) {
           const dataPath = sidecarToDataPath(sc.path);
           const orphaned = sc.path.endsWith(".mtime.mtime") || !allDataPaths.has(dataPath);
           if (!orphaned) continue;
@@ -19615,11 +19714,56 @@ var ZenFSGitee = (() => {
             }).catch((e) => log3.warn(`createSnapshot: failed to prune ${full}:`, e));
           }
         }
+        for (const sc of metadataSidecars) {
+          const full = "/" + sc.path;
+          log3.warn(`createSnapshot: deleting stale dotfile ${full}`);
+          if (typeof this.api.deleteFile === "function") {
+            void this.api.deleteFile(full, sc.sha, `Delete stale dotfile ${full}`).then(() => {
+              this.shaCache.delete(full);
+              this._deleteSha(full);
+            }).catch((e) => log3.warn(`createSnapshot: failed to delete ${full}:`, e));
+          }
+        }
         return snapshot;
       } catch (err2) {
         log3.warn(`createSnapshot failed:`, err2);
         return null;
       }
+    }
+    // ---------------------------------------------------------------------
+    // Empty-directory placeholder (`.keep`) handling.
+    //
+    // Git cannot store empty directories, so GiteeFS keeps a directory alive
+    // with an internal `.keep` placeholder — exactly like RemoteStorage. Per
+    // the backend contract (zen-fs-sync/docs/SyncableFS.md §1/§2) this
+    // placeholder is an internal implementation file that MUST be hidden from
+    // callers, while empty directories are preserved by the sync engine
+    // calling mkdir on the target (not by syncing the placeholder).
+    // ---------------------------------------------------------------------
+    async readdir(path) {
+      const names = await super.readdir(path);
+      return names.filter((n) => n !== ".keep");
+    }
+    async mkdir(path, options) {
+      const opts = options ?? { mode: S_IFDIR | 493 };
+      const result = await super.mkdir(path, opts);
+      const keepPath = `${path.endsWith("/") ? path.slice(0, -1) : path}/.keep`;
+      try {
+        if (!await this.exists(keepPath)) {
+          await this.writeFile(keepPath, "\n");
+        }
+      } catch {
+      }
+      return result;
+    }
+    async rmdir(path) {
+      try {
+        await super.unlink(
+          `${path.endsWith("/") ? path.slice(0, -1) : path}/.keep`
+        );
+      } catch {
+      }
+      await super.rmdir(path);
     }
     /**
     * Recursively delete `.mtime` sidecar files whose data file no longer
@@ -19636,6 +19780,7 @@ var ZenFSGitee = (() => {
       const sidecarItems = [];
       for (const item of tree) {
         if (item.type === "tree") continue;
+        if (isMetadataSidecarToDelete(item.path)) continue;
         const dataPath = sidecarToDataPath(item.path);
         if (dataPath) sidecarItems.push({ path: item.path, sha: item.sha });
         else allDataPaths.add(item.path);
@@ -19654,6 +19799,38 @@ var ZenFSGitee = (() => {
           removed++;
         } catch (e) {
           log3.warn(`pruneOrphanedMtimeSidecars: failed to delete ${full}:`, e);
+        }
+      }
+      return removed;
+    }
+    /**
+    * Delete stale hidden metadata files in the Gitee repo, unconditionally:
+    *  - single-dot `.version`/`.mtime` sidecars (`.name.mtime` / `.name.version`)
+    *  - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+    * Detection is OR, never AND (see {@link isMetadataSidecarToDelete}).
+    * Returns the number of files removed. Safe to call at any time; each
+    * deletion is best-effort.
+    *
+    * NOTE: `init()` and `createSnapshot()` already delete these sidecars on
+    * the fly during normal operation; this method forces an explicit,
+    * on-demand full cleanup (e.g. from a maintenance task).
+    */
+    async deleteMetadataSidecars(root = "/", preloadedTree) {
+      const normalizedRoot = root === "/" ? "" : root.replace(/^\/+|\/+$/g, "");
+      const tree = preloadedTree ?? await this.api.getTree(true);
+      let removed = 0;
+      for (const item of tree) {
+        if (item.type === "tree") continue;
+        if (normalizedRoot && item.path !== normalizedRoot && !item.path.startsWith(normalizedRoot + "/")) continue;
+        if (!isMetadataSidecarToDelete(item.path)) continue;
+        const full = "/" + item.path;
+        try {
+          await this.api.deleteFile(full, item.sha, `Delete dot-meta sidecar ${full}`);
+          this.shaCache.delete(full);
+          this._deleteSha(full);
+          removed++;
+        } catch (e) {
+          log3.warn(`deleteMetadataSidecars: failed to delete ${full}:`, e);
         }
       }
       return removed;

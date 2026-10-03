@@ -1,5 +1,5 @@
 import { IndexFS, Inode } from '@zenfs/core';
-import { GiteeAPI } from './gitee-api.js';
+import { GiteeAPI, type GiteeTreeItem } from './gitee-api.js';
 import type { GiteeOptions } from './types.js';
 /**
  * Minimal snapshot entry type, compatible with zen-fs-sync's FileSnapshot.
@@ -164,6 +164,29 @@ export declare class GiteeFS extends IndexFS {
      */
     writeFileWithMtime(path: string, data: string | Uint8Array, mtimeMs: number): Promise<void>;
     /**
+     * True when `content` is byte-identical to the file's currently cached remote
+     * content.
+     *
+     * Used to skip re-writing the data file (and its commit) when only the mtime
+     * changed — see {@link writeFileWithMtime} / {@link write}. This is a pure
+     * in-memory check (zero network): in a normal sync the data content is
+     * already cached by `preloadContents()` / `read()` before `writeFileWithMtime`
+     * is called, so the comparison is reliable. On a cache miss we return `false`
+     * (assume changed → write the data file) rather than fetching, which keeps
+     * behaviour predictable and avoids an extra read on every write.
+     */
+    private isContentUnchanged;
+    /**
+     * Return a legitimate, cached mtime (ms) for a file without re-querying the
+     * API, or `undefined` if one must be fetched. Mirrors `stat()`'s trust rules:
+     * a sidecar-derived value (fromSidecar:true) is always trusted while the SHA
+     * is unchanged; a commit-time value (fromSidecar:false) is trusted only
+     * within the negative-sidecar window (we've confirmed no sidecar exists for
+     * this path). Returns undefined otherwise so the caller re-fetches via the
+     * Commits API (a sidecar written later would otherwise be missed).
+     */
+    private _cachedLegitMtime;
+    /**
      * Build a file snapshot efficiently using the Git tree API.
      *
      * Instead of walking the filesystem and calling `stat()` for each file
@@ -173,11 +196,13 @@ export declare class GiteeFS extends IndexFS {
      * mtimeMs is taken from the `.mtime` sidecar when available (the real
      * modification time preserved across sync — see DESIGN.md §4), so the
      * target-side mtime stays comparable with the source's real mtime. When a
-     * file has no sidecar (legacy writes), it falls back to `shaHash(blobSha)`
-     * as a content-stable proxy — different content produces a different SHA,
-     * which the sync engine detects as a change, and which is more reliable
-     * than commit timestamps (only second-level precision, shared across files
-     * committed together).
+     * file has no sidecar (legacy writes), it falls back to the file's last
+     * commit time from the Commits API (`getLastCommit`) — a real timestamp,
+     * cached in mtimeCache (fromSidecar:false) and amortized across cycles via
+     * the noSidecarCache negative window. Commit time has only second-level
+     * precision and is shared across files committed together, but it is a
+     * legitimate mtime (unlike a content hash) and is superseded by the real
+     * sidecar mtime once the file is re-written.
      *
      * Sidecar files (`.filename.mtime`) are excluded from the snapshot so they
      * don't appear as user-visible files.
@@ -186,6 +211,9 @@ export declare class GiteeFS extends IndexFS {
      * snapshot could not be built.
      */
     createSnapshot(root: string, filter?: SnapshotFilter): Promise<Map<string, SnapshotEntry> | null>;
+    readdir(path: string): Promise<string[]>;
+    mkdir(path: string, options?: any): Promise<any>;
+    rmdir(path: string): Promise<void>;
     /**
     * Recursively delete `.mtime` sidecar files whose data file no longer
     * exists in the Gitee repo (orphaned sidecars). Returns the number of
@@ -195,6 +223,19 @@ export declare class GiteeFS extends IndexFS {
     * sync; this method forces an explicit, on-demand full cleanup.
     */
     pruneOrphanedMtimeSidecars(root?: string): Promise<number>;
+    /**
+    * Delete stale hidden metadata files in the Gitee repo, unconditionally:
+    *  - single-dot `.version`/`.mtime` sidecars (`.name.mtime` / `.name.version`)
+    *  - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+    * Detection is OR, never AND (see {@link isMetadataSidecarToDelete}).
+    * Returns the number of files removed. Safe to call at any time; each
+    * deletion is best-effort.
+    *
+    * NOTE: `init()` and `createSnapshot()` already delete these sidecars on
+    * the fly during normal operation; this method forces an explicit,
+    * on-demand full cleanup (e.g. from a maintenance task).
+    */
+    deleteMetadataSidecars(root?: string, preloadedTree?: GiteeTreeItem[]): Promise<number>;
     /**
     * Get the blob SHA for a file (from shaCache). Useful for external
 * revision checking (e.g. zen-fs-cache getRevision).

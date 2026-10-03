@@ -88,9 +88,10 @@
 - **问题**：早期 `write()`/`writeSync()` 只写数据文件、不写 sidecar，导致经普通写路径上云的文件无 sidecar，`stat()` 回退提交时间，源/目标 mtime 永远不一致，同步引擎每轮都重 PUT（「无差异空提交」）。
 - **修复**：`write`/`writeSync`/`writeFile` 全部在写数据后调用 `writeMtimeSidecar`/`writeMtimeSidecarSync`，将 `effectiveMtime`（传入的 `mtime` 或 `Date.now()`）写入 `.{name}.mtime`。`writeMtimeSidecar` **拒绝嵌套**（已是 sidecar 的路径不再写 `.mtime.mtime`），并刷新数据文件的 `mtimeCache` 为 `fromSidecar=true` 使下次 `stat` 立即生效。
 - **`writeFileWithMtime` 原子性**：先调用 Contents API 写数据与 sidecar，**两者都成功后**才更新本地 `contentCache/shaCache/inode/mtimeCache`，防止「缓存说存在但远端没写」导致引擎误判。
+- **内容未变则只更新 sidecar**：`write`/`writeSync`/`writeFileWithMtime` 在写数据前先与 `contentCache` 中已缓存的远端内容做字节比对（`bytesEqual`）。若内容完全一致（仅 mtime 不同），**跳过数据文件写入**（不新增无意义的 commit），只写/更新 `.{name}.mtime` sidecar 以携带新的真实 mtime；已有的 blob SHA 保持不变。比对为纯内存操作（零网络）：正常同步中 `preloadContents()`/`read()` 已把数据内容缓存，因此该优化会生效；缓存未命中时保守地照常写数据文件。这正是消除「无差异空提交」循环（`docs/requirements.md` FR-6）的关键。
 
 ### 2.5 快照算法（DM-4）
-`createSnapshot(root, filter)`：① 单次 `getTree`；② 第一遍用 `sidecarToDataPath` 建 `数据路径→sidecar路径` 映射（比 `isMtimeSidecar` 更可靠，能识别目录前缀路径如 `documents/.note.json.mtime`）；③ 第二遍为每个数据文件生成条目，mtime 优先取 sidecar 真实值，否则 `shaHash(blobSha)` 内容稳定代理；④ 应用 `root`/`include`/`exclude` 前缀过滤；⑤ sidecar 文件被排除。API 不可达返回 `null`（fail-safe）。
+`createSnapshot(root, filter)`：① 单次 `getTree`；② 第一遍用 `sidecarToDataPath` 建 `数据路径→sidecar路径` 映射（比 `isMtimeSidecar` 更可靠，能识别目录前缀路径如 `documents/.note.json.mtime`）；③ 第二遍为每个数据文件生成条目，mtime 优先取 sidecar 真实值，否则回退到 Commits API 的 commit 时间（`getLastCommit`，真实时间戳，缓存于 `mtimeCache` 并经 `noSidecarCache` 负窗口跨周期摊销，不回退到内容哈希）；④ 应用 `root`/`include`/`exclude` 前缀过滤；⑤ sidecar 文件被排除。API 不可达返回 `null`（fail-safe）。
 
 > **Backend contract reference**: Excluding `.mtime` sidecars from `createSnapshot` (and from `readdir` / `stat`) implements the "internal files must be hidden from callers" rule in `zen-fs-sync/docs/SyncableFS.md` → 《后端实现契约》§1. For empty-directory survival, see the same doc §2: a backend that cannot store empty directories must create **and hide** its own placeholder on `mkdir`, and the sync engine preserves empty dirs by calling `mkdir` on the target — not by syncing the placeholder. Gitee's current placeholder behavior and the `\n` consistency risk are tracked in §5 open problem #3.
 

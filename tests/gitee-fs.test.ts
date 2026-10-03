@@ -216,6 +216,50 @@ describe('GiteeFS', () => {
 			const body = JSON.parse(init?.body as string);
 			expect(body.sha).toBe('old-sha');
 		});
+
+		it('skips data-file write when content is unchanged (only mtime differs)', async () => {
+			const data = new TextEncoder().encode('xyz');
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'exist.txt', type: 'blob', sha: 'old-sha', size: 3, mode: '100644' },
+			]));
+			await fs.init();
+			// Simulate the sync engine having preloaded the remote content.
+			fs.contentCache.set('/exist.txt', data);
+
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') writtenPaths.push(String(url));
+				return Promise.resolve(mockOkJson({ content: { sha: 's' } }) as Response);
+			});
+
+			await fs.write('/exist.txt', data, 0, 1700000000999);
+
+			// Data file unchanged → no data PUT; only the .mtime sidecar is written.
+			expect(writtenPaths.some((u) => u.includes('exist.txt') && !u.includes('.mtime'))).toBe(false);
+			expect(writtenPaths.some((u) => u.includes('exist.txt.mtime'))).toBe(true);
+			// Existing blob SHA is preserved.
+			expect(fs.shaCache.get('/exist.txt')).toBe('old-sha');
+		});
+
+		it('writes data file when content is not cached (conservative on cache miss)', async () => {
+			const data = new TextEncoder().encode('xyz');
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'exist.txt', type: 'blob', sha: 'old-sha', size: 3, mode: '100644' },
+			]));
+			await fs.init();
+			// No contentCache seed → unknown content → must write data file.
+
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') writtenPaths.push(String(url));
+				return Promise.resolve(mockOkJson({ content: { sha: 'new-sha' } }) as Response);
+			});
+
+			await fs.write('/exist.txt', data, 0, 1700000000999);
+
+			expect(writtenPaths.some((u) => u.includes('exist.txt') && !u.includes('.mtime'))).toBe(true);
+			expect(fs.shaCache.get('/exist.txt')).toBe('new-sha');
+		});
 	});
 
 	describe('writeSync', () => {
@@ -234,6 +278,30 @@ describe('GiteeFS', () => {
 			await fs.sync();
 			// 1 (tree) + 1 (data write) + 1 (mtime sidecar write) = 3
 			expect(fetchSpy).toHaveBeenCalledTimes(3);
+		});
+
+		it('skips data-file write when content is unchanged (only mtime differs)', async () => {
+			const data = new TextEncoder().encode('sync-data');
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
+			await fs.init();
+			fs.createFileSync('/sync.txt', { mode: 0o644, uid: 0, gid: 0 });
+			fs.shaCache.set('/sync.txt', 'old-sha');
+			// Simulate the sync engine having preloaded the remote content.
+			fs.contentCache.set('/sync.txt', data);
+
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') writtenPaths.push(String(url));
+				return Promise.resolve(mockOkJson({ content: { sha: 's' } }) as Response);
+			});
+
+			fs.writeSync('/sync.txt', data, 0, 1700000000999);
+			await fs.sync();
+
+			// Data file unchanged → no data write; only the .mtime sidecar queued.
+			expect(writtenPaths.some((u) => u.includes('sync.txt') && !u.includes('.mtime'))).toBe(false);
+			expect(writtenPaths.some((u) => u.includes('sync.txt.mtime'))).toBe(true);
+			expect(fs.shaCache.get('/sync.txt')).toBe('old-sha');
 		});
 	});
 
@@ -625,6 +693,94 @@ describe('GiteeFS', () => {
 			//    After the fix: returns testMtime and converges.
 			const inode = await fs.stat('/config.json');
 			expect(inode.mtimeMs).toBe(testMtime); // preserved mtime must win
+			});
+
+			it('skips data-file write when content is unchanged (only mtime differs)', async () => {
+			const data = '{"key":"value"}';
+
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'S1', size: data.length, mode: '100644' },
+			]));
+			await fs.init();
+
+			// Simulate the sync engine already having the remote content cached.
+			fs.contentCache.set('/config.json', new TextEncoder().encode(data));
+
+			// Record which files actually get written (PUT/POST to Contents API).
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') {
+					writtenPaths.push(String(url));
+				}
+				return Promise.resolve(mockOkJson({ content: { sha: 'SC' } }) as Response);
+			});
+
+			// Content identical to the cached remote content, only mtime differs.
+			await fs.writeFileWithMtime('/config.json', data, 1700000000999);
+
+			// Data file must NOT be rewritten (no pointless commit), but the
+			// .mtime sidecar must still be written with the new mtime.
+			// (URLs carry a `?branch=...` query string, so match by substring.)
+			const dataWritten = writtenPaths.some((u) => u.includes('config.json') && !u.includes('.mtime'));
+			const sidecarWritten = writtenPaths.some((u) => u.includes('config.json.mtime'));
+			expect(dataWritten).toBe(false);
+			expect(sidecarWritten).toBe(true);
+			// Existing data blob SHA is preserved (no rewrite happened).
+			expect(fs.shaCache.get('/config.json')).toBe('S1');
+			});
+
+			it('still writes data file when content actually changed', async () => {
+			const oldData = '{"key":"old"}';
+			const newData = '{"key":"new"}';
+
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'S1', size: oldData.length, mode: '100644' },
+			]));
+			await fs.init();
+			// Cached content is the OLD content, but we're writing NEW content.
+			fs.contentCache.set('/config.json', new TextEncoder().encode(oldData));
+
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') {
+					writtenPaths.push(String(url));
+				}
+				return Promise.resolve(mockOkJson({ content: { sha: 'S2' } }) as Response);
+			});
+
+			await fs.writeFileWithMtime('/config.json', newData, 1700000000999);
+
+			// Content changed → the data file MUST be rewritten (PUT), and its
+			// blob SHA updated. The sidecar is written too.
+			const dataWritten = writtenPaths.some((u) => u.includes('config.json') && !u.includes('.mtime'));
+			const sidecarWritten = writtenPaths.some((u) => u.includes('config.json.mtime'));
+			expect(dataWritten).toBe(true);
+			expect(sidecarWritten).toBe(true);
+			expect(fs.shaCache.get('/config.json')).toBe('S2');
+			});
+
+			it('always creates data file for a brand-new path (no cached SHA)', async () => {
+			const data = '{"key":"value"}';
+
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
+			await fs.init();
+			// A coincidentally-identical buffer is cached, but the file has no
+			// remote SHA yet → it must still be created (POST), never skipped.
+			fs.contentCache.set('/config.json', new TextEncoder().encode(data));
+
+			const writtenPaths: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') {
+					writtenPaths.push(String(url));
+				}
+				return Promise.resolve(mockOkJson({ content: { sha: 'NEW' } }) as Response);
+			});
+
+			await fs.writeFileWithMtime('/config.json', data, 1700000000999);
+
+			const dataWritten = writtenPaths.some((u) => u.includes('config.json') && !u.includes('.mtime'));
+			expect(dataWritten).toBe(true);
+			expect(fs.shaCache.get('/config.json')).toBe('NEW');
 			});
 			});
 

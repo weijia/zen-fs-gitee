@@ -97,6 +97,19 @@ export function sidecarToDataPath(sidecarPath: string): string | null {
 }
 
 /**
+ * Byte-for-byte equality of two Uint8Arrays.
+ * Used to detect content-identical writes so the data file (and its commit)
+ * can be skipped while only the `.mtime` sidecar is updated.
+ */
+export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+/**
  * Hash a blob SHA to a numeric value for use as mtimeMs proxy.
  * Different content → different SHA → different hash → detected as change.
  */
