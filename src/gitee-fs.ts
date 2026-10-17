@@ -719,6 +719,17 @@ export class GiteeFS extends IndexFS {
 		if ((inode.mode & S_IFREG) !== S_IFREG) return inode;
 
 		const currentSha = this.shaCache.get(path);
+
+		// 按初始化 flag：useCommitTimeAsMtime 为真时，直接用 Gitee commit 时间作为
+		// 文件 mtime，并跳过 .mtime 边车探测（否则会对不存在的边车发 404 + 误导性 ERROR 日志）。
+		if (this.options.useCommitTimeAsMtime) {
+			const commit = await this.api.getLastCommit(path).catch(() => null);
+			if (commit) {
+				inode.update({ mtimeMs: new Date(commit.date).getTime() });
+			}
+			return inode;
+		}
+
 		const cached = this.mtimeCache.get(path);
 
 		// 1. Cached mtime. Trust it ONLY when it came from the .mtime sidecar
@@ -1070,7 +1081,8 @@ export class GiteeFS extends IndexFS {
 				// modification time (see DESIGN.md §4).
 				let resolved = false;
 				const sidecarPath = sidecarByData.get(fullPath);
-				if (sidecarPath) {
+				// flag 为真时忽略 .mtime 边车，统一用 commit 时间（与 stat() 行为一致）
+				if (!this.options.useCommitTimeAsMtime && sidecarPath) {
 					const cached = this.contentCache.get(sidecarPath);
 					if (cached) {
 						const parsed = Number(new TextDecoder().decode(cached).trim());

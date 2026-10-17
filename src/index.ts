@@ -15,6 +15,7 @@ const _Gitee: Backend<GiteeFS, GiteeOptions> = {
 		repo: { type: 'string', required: true },
 		branch: { type: 'string', required: false },
 		baseUrl: { type: 'string', required: false },
+		useCommitTimeAsMtime: { type: 'boolean', required: false },
 	},
 	isAvailable() {
 		return typeof globalThis.fetch === 'function';
