@@ -20,7 +20,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
         run: npm ci
@@ -32,9 +31,9 @@ jobs:
       - name: Build
         run: npm run build
 
-      # OIDC passwordless publish via Trusted Publisher (no NPM_TOKEN needed).
-      # `id-token: write` above lets Actions mint an OIDC token that npm verifies
-      # against the Trusted Publisher configured for this package on npmjs.com.
-      # The old secrets.NPM_TOKEN stopped working (npm returned 404 on PUT).
+      # OIDC passwordless publish via npm Trusted Publisher.
+      # NOTE: do NOT set `registry-url` on setup-node — it writes the GitHub
+      # token into .npmrc, and npm registry answers 404 on PUT when it receives
+      # an invalid bearer token. OIDC minting only needs `id-token: write`.
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --registry=https://registry.npmjs.org/
