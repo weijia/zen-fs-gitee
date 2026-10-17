@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +32,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      # OIDC passwordless publish via Trusted Publisher (no NPM_TOKEN needed).
+      # `id-token: write` above lets Actions mint an OIDC token that npm verifies
+      # against the Trusted Publisher configured for this package on npmjs.com.
+      # The old secrets.NPM_TOKEN stopped working (npm returned 404 on PUT).
       - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
