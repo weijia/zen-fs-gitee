@@ -20,22 +20,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: 'Debug OIDC env and npm version'
-        run: |
-          echo "npm version: $(npm -v)"
-          echo "HAS_ID_TOKEN_URL=[${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}]"
-          echo "HAS_ID_TOKEN_TOKEN=[${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}]"
-          echo "--- user npmrc ---"
-          cat "$HOME/.npmrc" 2>/dev/null || echo "(none)"
-          echo "--- project npmrc ---"
-          cat .npmrc 2>/dev/null || echo "(none)"
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+
       - name: Build
         run: npm run build
 
+      # OIDC passwordless publish via npm Trusted Publisher (no NPM_TOKEN).
+      # Requires the Trusted Publisher to be configured on npmjs.com for this
+      # package: Settings -> Trusted Publisher -> GitHub Actions
+      #   owner/repo: weijia/zen-fs-gitee, workflow: publish.yml
       - name: Publish to npm
-        run: npm publish --access public --provenance --registry=https://registry.npmjs.org/
+        run: npm publish --access public --provenance
