@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Debug: OIDC env + npm version
+      - name: 'Debug OIDC env and npm version'
         run: |
           echo "npm version: $(npm -v)"
           echo "HAS_ID_TOKEN_URL=[${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}]"
