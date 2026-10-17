@@ -16,11 +16,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Node 24 => npm 11.x, required for OIDC / npm Trusted Publisher publish.
+      # Node 22 => npm 10.9.x only supports provenance signing, not OIDC auth.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Print npm version
+        run: npm -v
 
       - name: Install dependencies
         run: npm ci
@@ -33,8 +38,5 @@ jobs:
         run: npm run build
 
       # OIDC passwordless publish via npm Trusted Publisher (no NPM_TOKEN).
-      # Requires the Trusted Publisher to be configured on npmjs.com for this
-      # package: Settings -> Trusted Publisher -> GitHub Actions
-      #   owner/repo: weijia/zen-fs-gitee, workflow: publish.yml
       - name: Publish to npm
         run: npm publish --access public --provenance
