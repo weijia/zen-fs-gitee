@@ -13,11 +13,12 @@ export interface GiteeOptions {
 	/** Base URL for the Gitee API. Defaults to `https://gitee.com/api/v5`. */
 	baseUrl?: string;
 	/**
-	 * If true, `stat()` and the snapshot builder use the Gitee **commit time** as
-	 * the file's modification time and skip probing the `.mtime` sidecar file
-	 * entirely. This avoids one raw-API request (and a harmless-but-noisy 404)
-	 * per file when sidecars are not used. Defaults to `false` (preserve the
-	 * sidecar-based real mtime when available, falling back to commit time).
+	 * If true, the Gitee **commit time** is used as the file's modification time:
+	 * `stat()` and the snapshot builder skip probing the `.mtime` sidecar file,
+	 * and `write()`/`writeSync()` skip writing the sidecar too (no redundant
+	 * extra commit). This avoids one raw-API request (and a harmless-but-noisy
+	 * 404) per file when sidecars are not used. Defaults to `false` (preserve
+	 * the sidecar-based real mtime when available, falling back to commit time).
 	 */
 	useCommitTimeAsMtime?: boolean;
 	/**

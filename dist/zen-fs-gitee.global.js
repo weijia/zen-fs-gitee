@@ -19292,7 +19292,9 @@ var ZenFSGitee = (() => {
       }
       this.contentCache.set(path, writeContent);
       this._persistContent(path, writeContent);
-      await this.writeMtimeSidecar(path, effectiveMtime);
+      if (!this.options.useCommitTimeAsMtime) {
+        await this.writeMtimeSidecar(path, effectiveMtime);
+      }
     }
     writeSync(path, data, offset, mtimeMs) {
       const previous = this.contentCache.get(path);
@@ -19319,7 +19321,9 @@ var ZenFSGitee = (() => {
         })().catch(() => {
         })
       );
-      this.writeMtimeSidecarSync(path, effectiveMtime);
+      if (!this.options.useCommitTimeAsMtime) {
+        this.writeMtimeSidecarSync(path, effectiveMtime);
+      }
     }
     // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
     /** Write/update the `.mtime` sidecar for a file (async). */
@@ -19411,6 +19415,13 @@ var ZenFSGitee = (() => {
       const inode = await super.stat(path);
       if ((inode.mode & S_IFREG) !== S_IFREG) return inode;
       const currentSha = this.shaCache.get(path);
+      if (this.options.useCommitTimeAsMtime) {
+        const commit = await this.api.getLastCommit(path).catch(() => null);
+        if (commit) {
+          inode.update({ mtimeMs: new Date(commit.date).getTime() });
+        }
+        return inode;
+      }
       const cached = this.mtimeCache.get(path);
       if (cached && cached.sha === currentSha) {
         const neg2 = this.noSidecarCache.get(path);
@@ -19643,7 +19654,7 @@ var ZenFSGitee = (() => {
           const entry = { relPath, size: item.size || 0, fullPath, itemPath: item.path, sha: item.sha, mtimeMs: 0 };
           let resolved = false;
           const sidecarPath = sidecarByData.get(fullPath);
-          if (sidecarPath) {
+          if (!this.options.useCommitTimeAsMtime && sidecarPath) {
             const cached = this.contentCache.get(sidecarPath);
             if (cached) {
               const parsed = Number(new TextDecoder().decode(cached).trim());
@@ -19902,7 +19913,8 @@ var ZenFSGitee = (() => {
       owner: { type: "string", required: true },
       repo: { type: "string", required: true },
       branch: { type: "string", required: false },
-      baseUrl: { type: "string", required: false }
+      baseUrl: { type: "string", required: false },
+      useCommitTimeAsMtime: { type: "boolean", required: false }
     },
     isAvailable() {
       return typeof globalThis.fetch === "function";

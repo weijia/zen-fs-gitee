@@ -543,7 +543,12 @@ export class GiteeFS extends IndexFS {
 
 		// Write the .mtime sidecar so cross-backend sync can compare the real
 		// modification time instead of the Gitee commit time.
-		await this.writeMtimeSidecar(path, effectiveMtime);
+		// Skip it entirely when useCommitTimeAsMtime is on: the file's mtime IS the
+		// Gitee commit time, so a separate sidecar would only create a redundant
+		// extra commit — and stat()/createSnapshot already ignore it in this mode.
+		if (!this.options.useCommitTimeAsMtime) {
+			await this.writeMtimeSidecar(path, effectiveMtime);
+		}
 	}
 
 	writeSync(path: string, data: Uint8Array, offset: number, mtimeMs?: number): void {
@@ -588,7 +593,10 @@ export class GiteeFS extends IndexFS {
 		);
 
 		// Write the .mtime sidecar (queued, fire-and-forget) — see DESIGN.md §4.
-		this.writeMtimeSidecarSync(path, effectiveMtime);
+		// Skip it when useCommitTimeAsMtime is on (mirrors write() above).
+		if (!this.options.useCommitTimeAsMtime) {
+			this.writeMtimeSidecarSync(path, effectiveMtime);
+		}
 	}
 
 	// --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---

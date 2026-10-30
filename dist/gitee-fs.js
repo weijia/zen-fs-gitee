@@ -480,7 +480,12 @@ export class GiteeFS extends IndexFS {
         this._persistContent(path, writeContent);
         // Write the .mtime sidecar so cross-backend sync can compare the real
         // modification time instead of the Gitee commit time.
-        await this.writeMtimeSidecar(path, effectiveMtime);
+        // Skip it entirely when useCommitTimeAsMtime is on: the file's mtime IS the
+        // Gitee commit time, so a separate sidecar would only create a redundant
+        // extra commit — and stat()/createSnapshot already ignore it in this mode.
+        if (!this.options.useCommitTimeAsMtime) {
+            await this.writeMtimeSidecar(path, effectiveMtime);
+        }
     }
     writeSync(path, data, offset, mtimeMs) {
         // Capture the previously cached content BEFORE we overwrite it — it is the
@@ -518,7 +523,10 @@ export class GiteeFS extends IndexFS {
         })()
             .catch(() => { }));
         // Write the .mtime sidecar (queued, fire-and-forget) — see DESIGN.md §4.
-        this.writeMtimeSidecarSync(path, effectiveMtime);
+        // Skip it when useCommitTimeAsMtime is on (mirrors write() above).
+        if (!this.options.useCommitTimeAsMtime) {
+            this.writeMtimeSidecarSync(path, effectiveMtime);
+        }
     }
     // --- Mtime sidecar helpers (mirrors RemoteStorageFileSystem.writeFile) ---
     /** Write/update the `.mtime` sidecar for a file (async). */
@@ -634,6 +642,15 @@ export class GiteeFS extends IndexFS {
         if ((inode.mode & S_IFREG) !== S_IFREG)
             return inode;
         const currentSha = this.shaCache.get(path);
+        // 按初始化 flag：useCommitTimeAsMtime 为真时，直接用 Gitee commit 时间作为
+        // 文件 mtime，并跳过 .mtime 边车探测（否则会对不存在的边车发 404 + 误导性 ERROR 日志）。
+        if (this.options.useCommitTimeAsMtime) {
+            const commit = await this.api.getLastCommit(path).catch(() => null);
+            if (commit) {
+                inode.update({ mtimeMs: new Date(commit.date).getTime() });
+            }
+            return inode;
+        }
         const cached = this.mtimeCache.get(path);
         // 1. Cached mtime. Trust it ONLY when it came from the .mtime sidecar
         //    (exact, stable), or when we have *also* confirmed (via 404) that no
@@ -952,7 +969,8 @@ export class GiteeFS extends IndexFS {
                 // modification time (see DESIGN.md §4).
                 let resolved = false;
                 const sidecarPath = sidecarByData.get(fullPath);
-                if (sidecarPath) {
+                // flag 为真时忽略 .mtime 边车，统一用 commit 时间（与 stat() 行为一致）
+                if (!this.options.useCommitTimeAsMtime && sidecarPath) {
                     const cached = this.contentCache.get(sidecarPath);
                     if (cached) {
                         const parsed = Number(new TextDecoder().decode(cached).trim());
