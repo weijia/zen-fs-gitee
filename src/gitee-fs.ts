@@ -192,21 +192,16 @@ export class GiteeFS extends IndexFS {
 		// 1. Warm start: load persistent caches from IndexedDB
 		await this.loadFromIDB();
 
-		// 2. Fetch fresh tree from API
-		let tree: GiteeTreeItem[] = [];
-		try {
-			tree = await this.api.getTree(true);
-		} catch (err: any) {
-			const msg = err.message || '';
-			// Branch not found — try to create it
-			if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
-				log.log(`Branch '${this.options.branch}' not found, attempting to create...`);
-				await this.api.createBranch(this.options.branch || 'master', 'master');
-				// Retry loading tree
-				tree = await this.api.getTree(true);
-			} else {
-				throw err;
-			}
+		// 2. Fetch fresh tree from API. If the configured branch is missing,
+		//    GiteeAPI falls back to the repository's default_branch (once) and
+		//    keeps using it for this instance. The user's configured branch is
+		//    never rewritten; our init() no longer tries to CREATE a missing
+		//    branch (that surprised users and failed on empty repos).
+		const tree: GiteeTreeItem[] = await this.api.getTree(true);
+		if (this.api.fellBackToDefaultBranch) {
+			log.log(
+				`configured branch '${this.options.branch}' was not found; using default branch '${this.api.currentBranch}'`
+			);
 		}
 
 		// 3. Build index from fresh tree, reusing cached content where SHA is unchanged
