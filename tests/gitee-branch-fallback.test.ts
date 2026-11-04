@@ -98,7 +98,7 @@ describe('GiteeAPI branch fallback', () => {
 			.mockResolvedValueOnce(jsonError(404)) // tree
 			.mockResolvedValueOnce(jsonOk({ default_branch: null })) // repo meta (empty repo)
 			.mockResolvedValueOnce(jsonOk([])) // no branches
-			.mockResolvedValueOnce(jsonOk({ content: { sha: 'init-sha' } }, 201)) // POST README
+			.mockResolvedValueOnce(jsonOk({ content: { sha: 'init-sha' } }, 201)) // POST .keep
 			.mockResolvedValueOnce(jsonOk({ tree: [TREE_ITEM] })); // tree after init
 
 		const api = newApi('master');
@@ -110,13 +110,48 @@ describe('GiteeAPI branch fallback', () => {
 		expect(fetchSpy).toHaveBeenCalledTimes(5);
 
 		const post = fetchSpy.mock.calls[3];
-		expect(String(post[0])).toContain('/contents/README.md');
+		expect(String(post[0])).toContain('/contents/.keep');
 		expect(String(post[0])).toContain('branch=master');
 		expect((post[1] as MockInit)?.method).toBe('POST');
 		const body = JSON.parse(String((post[1] as MockInit)?.body));
 		expect(body.message).toBe('chore: 初始化仓库（zen-fs 自动创建）');
 		const decoded = Buffer.from(body.content, 'base64').toString('utf8');
-		expect(decoded).toContain('由 zen-fs 初始化');
+		expect(decoded).toBe('');
+
+		expect(logs.join('\n')).toContain('仓库为空，已自动创建初始提交（分支 master）');
+		expect(logs.join('\n')).not.toContain('test-token');
+	});
+
+	it('retries the initialization write with a single newline when empty content is rejected', async () => {
+		const logs: string[] = [];
+		vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+			logs.push(args.map((a) => String(a)).join(' '));
+		});
+		fetchSpy
+			.mockResolvedValueOnce(jsonError(404)) // tree
+			.mockResolvedValueOnce(jsonOk({ default_branch: null })) // repo meta (empty repo)
+			.mockResolvedValueOnce(jsonOk([])) // no branches
+			.mockResolvedValueOnce(jsonError(400, '{"message":"content is empty"}')) // POST .keep (empty)
+			.mockResolvedValueOnce(jsonOk({ content: { sha: 'init-sha' } }, 201)) // POST .keep (newline)
+			.mockResolvedValueOnce(jsonOk({ tree: [TREE_ITEM] })); // tree after init
+
+		const api = newApi('master');
+		const tree = await api.getTree(true);
+
+		expect(tree).toHaveLength(1);
+		expect(api.currentBranch).toBe('master');
+		expect(api.autoInitializedEmptyRepo).toBe(true);
+		expect(fetchSpy).toHaveBeenCalledTimes(6);
+
+		const posts = fetchSpy.mock.calls.filter((c) => (c[1] as MockInit)?.method === 'POST');
+		expect(posts).toHaveLength(2);
+		const first = JSON.parse(String((posts[0][1] as MockInit)?.body));
+		const second = JSON.parse(String((posts[1][1] as MockInit)?.body));
+		expect(Buffer.from(first.content, 'base64').toString('utf8')).toBe('');
+		expect(Buffer.from(second.content, 'base64').toString('utf8')).toBe('\n');
+		expect(second.message).toBe('chore: 初始化仓库（zen-fs 自动创建）');
+		expect(String(posts[1][0])).toContain('/contents/.keep');
+		expect(String(posts[1][0])).toContain('branch=master');
 
 		expect(logs.join('\n')).toContain('仓库为空，已自动创建初始提交（分支 master）');
 		expect(logs.join('\n')).not.toContain('test-token');

@@ -63,8 +63,11 @@ export declare class GiteeAPI {
     private readRepoState;
     /**
      * Bootstrap an empty repository through the Contents API: creating
-     * `README.md` produces the first commit. `POST /branches` is unusable here
+     * `.keep` produces the first commit. `POST /branches` is unusable here
      * because it requires an existing `refs` start point.
+     *
+     * `.keep` is the sync layer's hidden placeholder, so an initialized
+     * repository still looks empty to readers while the branch/tree exist.
      *
      * Runs at most once per instance. On failure the error is cached so later
      * sync rounds never write again.

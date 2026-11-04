@@ -136,8 +136,11 @@ export class GiteeAPI {
 
 	/**
 	 * Bootstrap an empty repository through the Contents API: creating
-	 * `README.md` produces the first commit. `POST /branches` is unusable here
+	 * `.keep` produces the first commit. `POST /branches` is unusable here
 	 * because it requires an existing `refs` start point.
+	 *
+	 * `.keep` is the sync layer's hidden placeholder, so an initialized
+	 * repository still looks empty to readers while the branch/tree exist.
 	 *
 	 * Runs at most once per instance. On failure the error is cached so later
 	 * sync rounds never write again.
@@ -147,31 +150,46 @@ export class GiteeAPI {
 		if (this.autoInitError) throw this.autoInitError;
 
 		const targetBranch = this.configuredBranch || defaultBranch || 'master';
-		const content = `# ${this.repo}\n\n由 zen-fs 初始化\n`;
-		try {
-			await this.request(`/repos/${this.owner}/${this.repo}/contents/README.md?branch=${targetBranch}`, {
+		const message = 'chore: 初始化仓库（zen-fs 自动创建）';
+		const path = `/repos/${this.owner}/${this.repo}/contents/.keep?branch=${targetBranch}`;
+		const writeKeep = (content: Uint8Array) =>
+			this.request(path, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					content: encodeBase64(new TextEncoder().encode(content)),
-					message: 'chore: 初始化仓库（zen-fs 自动创建）',
-				}),
+				body: JSON.stringify({ content: encodeBase64(content), message }),
 			});
-		} catch (err) {
+		const readableError = (err: unknown) => {
 			const status = GiteeAPI.httpStatus(err);
 			const detail = err instanceof Error ? err.message : String(err);
-			const readable =
-				status === 403
+			return status === 403
+				? new Error(
+					`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化被拒绝：token 缺少写入权限（需要 projects 读写权限）`,
+				)
+				: status === 404
 					? new Error(
-						`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化被拒绝：token 缺少写入权限（需要 projects 读写权限）`,
+						`Gitee 仓库 ${this.owner}/${this.repo} 不存在或无权访问，无法自动初始化`,
 					)
-					: status === 404
-						? new Error(
-							`Gitee 仓库 ${this.owner}/${this.repo} 不存在或无权访问，无法自动初始化`,
-						)
-						: new Error(`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化失败：${detail}`);
-			this.autoInitError = readable;
-			throw readable;
+					: new Error(`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化失败：${detail}`);
+		};
+
+		try {
+			// Prefer a truly empty placeholder file.
+			await writeKeep(new Uint8Array(0));
+		} catch (err) {
+			const status = GiteeAPI.httpStatus(err);
+			if (status !== 400 && status !== 422) {
+				const readable = readableError(err);
+				this.autoInitError = readable;
+				throw readable;
+			}
+			// Gitee can reject an empty `content` field; retry once with a single newline.
+			try {
+				await writeKeep(new TextEncoder().encode('\n'));
+			} catch (retryErr) {
+				const readable = readableError(retryErr);
+				this.autoInitError = readable;
+				throw readable;
+			}
 		}
 
 		this.autoInitialized = true;
