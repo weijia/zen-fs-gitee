@@ -84,7 +84,8 @@ export declare class GiteeFS extends IndexFS {
     private loadFromIDB;
     /**
      * Initialize the file system by loading the repository tree.
-     * If the configured branch does not exist, it will be created from 'master'.
+     * If the configured branch does not exist, falls back to the repository's
+     * default branch. An empty repository is bootstrapped with one initial commit.
      *
      * Warm start: persistent caches (shaCache, contentCache, mtimeCache) are
      * loaded from IndexedDB first, so file contents from the previous session

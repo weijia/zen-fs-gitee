@@ -41,21 +41,35 @@ export declare class GiteeAPI {
      * (and the UI) still shows what they typed.
      */
     private resolvedBranch;
+    /** Raw user-configured branch (may be undefined). Used when bootstrapping an empty repo. */
+    private configuredBranch?;
+    /** Set once auto-initialization succeeded, so it never runs twice on one instance. */
+    private autoInitialized;
+    /** First auto-initialization error; repeated sync rounds rethrow it instead of writing again. */
+    private autoInitError;
     constructor(options: GiteeOptions);
     /** Branch used by every API call (configured, or the resolved default after a fallback). */
     get currentBranch(): string;
     /** True when the configured branch was missing and a default branch was used instead. */
     get fellBackToDefaultBranch(): boolean;
+    /** True when an empty repository was bootstrapped with an initial commit. */
+    get autoInitializedEmptyRepo(): boolean;
     private static httpStatus;
     /**
      * The tree endpoint returns 404 both for "repo missing/no permission" and
-     * "branch missing", so on a 404 ask the repository metadata (and, for empty
-     * repos, the branch list) which case we are in.
-     *
-     * @returns The default branch to retry with, or `null` when the caller
-     *          should surface the original 404.
+     * "branch missing", so on a 404 ask the repository metadata and branch list
+     * which case we are in.
      */
-    private resolveBranchFallback;
+    private readRepoState;
+    /**
+     * Bootstrap an empty repository through the Contents API: creating
+     * `README.md` produces the first commit. `POST /branches` is unusable here
+     * because it requires an existing `refs` start point.
+     *
+     * Runs at most once per instance. On failure the error is cached so later
+     * sync rounds never write again.
+     */
+    private initializeEmptyRepository;
     request(path: string, init?: RequestInit): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
     /**
