@@ -32,9 +32,30 @@ export declare class GiteeAPI {
     private token;
     private owner;
     private repo;
+    /** User-configured branch. Never rewritten — fallbacks are runtime-only. */
     private branch;
     private baseUrl;
+    /**
+     * Branch actually used for API calls after a runtime fallback. `null` means
+     * the configured branch. Kept separate from `branch` so the user's config
+     * (and the UI) still shows what they typed.
+     */
+    private resolvedBranch;
     constructor(options: GiteeOptions);
+    /** Branch used by every API call (configured, or the resolved default after a fallback). */
+    get currentBranch(): string;
+    /** True when the configured branch was missing and a default branch was used instead. */
+    get fellBackToDefaultBranch(): boolean;
+    private static httpStatus;
+    /**
+     * The tree endpoint returns 404 both for "repo missing/no permission" and
+     * "branch missing", so on a 404 ask the repository metadata (and, for empty
+     * repos, the branch list) which case we are in.
+     *
+     * @returns The default branch to retry with, or `null` when the caller
+     *          should surface the original 404.
+     */
+    private resolveBranchFallback;
     request(path: string, init?: RequestInit): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
     /**
@@ -47,7 +68,7 @@ export declare class GiteeAPI {
      * supported by Gitee and returns the branch's head commit SHA under
      * `commit.sha`.
      */
-    getBranchSha(branch: string): Promise<string | null>;
+    getBranchSha(branch?: string): Promise<string | null>;
     /**
      * Create a new branch from an existing branch.
      * Uses POST /repos/{owner}/{repo}/branches — the only branch-creation

@@ -37,14 +37,76 @@ export class GiteeAPI {
     token;
     owner;
     repo;
+    /** User-configured branch. Never rewritten — fallbacks are runtime-only. */
     branch;
     baseUrl;
+    /**
+     * Branch actually used for API calls after a runtime fallback. `null` means
+     * the configured branch. Kept separate from `branch` so the user's config
+     * (and the UI) still shows what they typed.
+     */
+    resolvedBranch = null;
     constructor(options) {
         this.token = options.token;
         this.owner = options.owner;
         this.repo = options.repo;
         this.branch = options.branch || 'master';
         this.baseUrl = options.baseUrl || 'https://gitee.com/api/v5';
+    }
+    /** Branch used by every API call (configured, or the resolved default after a fallback). */
+    get currentBranch() {
+        return this.resolvedBranch ?? this.branch;
+    }
+    /** True when the configured branch was missing and a default branch was used instead. */
+    get fellBackToDefaultBranch() {
+        return this.resolvedBranch !== null && this.resolvedBranch !== this.branch;
+    }
+    static httpStatus(err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const match = /Gitee API (\d+)/.exec(msg);
+        return match ? Number(match[1]) : null;
+    }
+    /**
+     * The tree endpoint returns 404 both for "repo missing/no permission" and
+     * "branch missing", so on a 404 ask the repository metadata (and, for empty
+     * repos, the branch list) which case we are in.
+     *
+     * @returns The default branch to retry with, or `null` when the caller
+     *          should surface the original 404.
+     */
+    async resolveBranchFallback() {
+        let meta;
+        try {
+            meta = await this.request(`/repos/${this.owner}/${this.repo}`);
+        }
+        catch (err) {
+            if (GiteeAPI.httpStatus(err) === 404) {
+                throw new Error(`Gitee 仓库 ${this.owner}/${this.repo} 不存在或无权访问（请检查 owner/repo 和 token 权限）`);
+            }
+            log.log(`读取仓库信息失败（${err instanceof Error ? err.message : String(err)}），保留原始分支错误`);
+            return null;
+        }
+        // Empty repository: no branch can be read or written until the web UI
+        // creates the first commit.
+        let branchCount = null;
+        try {
+            const list = await this.request(`/repos/${this.owner}/${this.repo}/branches`);
+            branchCount = Array.isArray(list) ? list.length : null;
+        }
+        catch {
+            /* fall back to default_branch below */
+        }
+        if (branchCount === 0) {
+            throw new Error(`Gitee 仓库 ${this.owner}/${this.repo} 为空（无任何分支/提交），无法读取文件树：`
+                + '请先在 Gitee 网页上完成一次初始化提交（例如创建 README）后再重试');
+        }
+        const defaultBranch = meta?.default_branch || undefined;
+        if (!defaultBranch || defaultBranch === this.branch) {
+            log.log(`指定分支 '${this.branch}' 不存在，且没有可用的默认分支（仓库未返回 default_branch），保留原始错误`);
+            return null;
+        }
+        log.log(`指定分支 '${this.branch}' 不存在，已回落到默认分支 '${defaultBranch}'`);
+        return defaultBranch;
     }
     async request(path, init) {
         const separator = path.includes('?') ? '&' : '?';
@@ -69,8 +131,21 @@ export class GiteeAPI {
     // Read-only Git Data API (supported by Gitee)
     // -----------------------------------------------------------------------
     async getTree(recursive = true) {
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/git/trees/${this.branch}?recursive=${recursive ? 1 : 0}`);
-        return data.tree || [];
+        const treePath = (branch) => `/repos/${this.owner}/${this.repo}/git/trees/${branch}?recursive=${recursive ? 1 : 0}`;
+        try {
+            const data = await this.request(treePath(this.currentBranch));
+            return data.tree || [];
+        }
+        catch (err) {
+            if (GiteeAPI.httpStatus(err) !== 404)
+                throw err;
+            const fallback = await this.resolveBranchFallback();
+            if (!fallback)
+                throw err;
+            const data = await this.request(treePath(fallback));
+            this.resolvedBranch = fallback;
+            return data.tree || [];
+        }
     }
     /**
      * Get the latest commit SHA of a branch.
@@ -82,7 +157,7 @@ export class GiteeAPI {
      * supported by Gitee and returns the branch's head commit SHA under
      * `commit.sha`.
      */
-    async getBranchSha(branch) {
+    async getBranchSha(branch = this.currentBranch) {
         const data = await this.request(`/repos/${this.owner}/${this.repo}/branches/${branch}`);
         return data?.commit?.sha ?? null;
     }
@@ -110,10 +185,10 @@ export class GiteeAPI {
     // Contents API (GET / POST / PUT / DELETE — all supported by Gitee)
     // -----------------------------------------------------------------------
     async getContents(path) {
-        return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.branch}`);
+        return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.currentBranch}`);
     }
     async getRaw(path) {
-        return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.branch}`);
+        return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.currentBranch}`);
     }
     /**
      * Create a new file via Contents API. Returns the new blob SHA.
@@ -125,15 +200,24 @@ export class GiteeAPI {
         if (content.length === 0) {
             content = new TextEncoder().encode('\n');
         }
-        const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                content: encodeBase64(content),
-                message,
-            }),
-        });
-        return data?.content?.sha || '';
+        try {
+            const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    content: encodeBase64(content),
+                    message,
+                }),
+            });
+            return data?.content?.sha || '';
+        }
+        catch (err) {
+            if (GiteeAPI.httpStatus(err) === 404) {
+                throw new Error(`Gitee 仓库 ${this.owner}/${this.repo} 无法写入：分支 '${this.currentBranch}' 不存在或仓库为空。`
+                    + '若仓库为空，请先在 Gitee 网页上完成一次初始化提交（例如创建 README）后再写入');
+            }
+            throw err;
+        }
     }
     /**
      * Update an existing file via Contents API. Returns the new blob SHA.
@@ -145,7 +229,7 @@ export class GiteeAPI {
             content = new TextEncoder().encode('\n');
         }
         try {
-            const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
+            const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -162,7 +246,7 @@ export class GiteeAPI {
                 log.warn(`SHA mismatch for ${path}, refreshing SHA and retrying...`);
                 const freshSha = await this.getFileSha(path);
                 if (freshSha) {
-                    const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
+                    const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -198,7 +282,7 @@ export class GiteeAPI {
                 log.warn(`SHA mismatch for delete ${path}, refreshing SHA and retrying...`);
                 const freshSha = await this.getFileSha(path);
                 if (freshSha) {
-                    await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
+                    await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
                         method: 'DELETE',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -209,6 +293,12 @@ export class GiteeAPI {
                     return;
                 }
             }
+            // Gitee 对删除“已不存在的文件”返回 400（中文措辞“文件新建失败”）。
+            // 目标文件既然已不在远端，删除即达成目的——视为成功，避免
+            // createSnapshot 清理孤儿 sidecar / 处理 tombstone 时每次都被误报为失败。
+            const stillExists = await this.getContents(path).then(() => true).catch(() => false);
+            if (!stillExists)
+                return;
             throw err;
         }
     }
@@ -233,7 +323,7 @@ export class GiteeAPI {
      */
     async getLastCommit(path) {
         try {
-            const commits = await this.request(`/repos/${this.owner}/${this.repo}/commits?path=${apiPath(path)}&ref=${this.branch}&per_page=1`);
+            const commits = await this.request(`/repos/${this.owner}/${this.repo}/commits?path=${apiPath(path)}&ref=${this.currentBranch}&per_page=1`);
             if (Array.isArray(commits) && commits.length > 0) {
                 const commit = commits[0];
                 const date = commit.commit?.committer?.date;
