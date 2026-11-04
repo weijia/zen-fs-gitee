@@ -178,7 +178,8 @@ export class GiteeFS extends IndexFS {
 
 	/**
 	 * Initialize the file system by loading the repository tree.
-	 * If the configured branch does not exist, it will be created from 'master'.
+	 * If the configured branch does not exist, falls back to the repository's
+	 * default branch. An empty repository is bootstrapped with one initial commit.
 	 *
 	 * Warm start: persistent caches (shaCache, contentCache, mtimeCache) are
 	 * loaded from IndexedDB first, so file contents from the previous session
@@ -201,6 +202,11 @@ export class GiteeFS extends IndexFS {
 		if (this.api.fellBackToDefaultBranch) {
 			log.log(
 				`configured branch '${this.options.branch}' was not found; using default branch '${this.api.currentBranch}'`
+			);
+		}
+		if (this.api.autoInitializedEmptyRepo) {
+			log.log(
+				`repository was empty; created an initial commit on branch '${this.api.currentBranch}'`
 			);
 		}
 

@@ -66,11 +66,18 @@ export class GiteeAPI {
 	 * (and the UI) still shows what they typed.
 	 */
 	private resolvedBranch: string | null = null;
+	/** Raw user-configured branch (may be undefined). Used when bootstrapping an empty repo. */
+	private configuredBranch?: string;
+	/** Set once auto-initialization succeeded, so it never runs twice on one instance. */
+	private autoInitialized = false;
+	/** First auto-initialization error; repeated sync rounds rethrow it instead of writing again. */
+	private autoInitError: Error | null = null;
 
 	constructor(options: GiteeOptions) {
 		this.token = options.token;
 		this.owner = options.owner;
 		this.repo = options.repo;
+		this.configuredBranch = options.branch;
 		this.branch = options.branch || 'master';
 		this.baseUrl = options.baseUrl || 'https://gitee.com/api/v5';
 	}
@@ -85,6 +92,11 @@ export class GiteeAPI {
 		return this.resolvedBranch !== null && this.resolvedBranch !== this.branch;
 	}
 
+	/** True when an empty repository was bootstrapped with an initial commit. */
+	get autoInitializedEmptyRepo(): boolean {
+		return this.autoInitialized;
+	}
+
 	private static httpStatus(err: unknown): number | null {
 		const msg = err instanceof Error ? err.message : String(err);
 		const match = /Gitee API (\d+)/.exec(msg);
@@ -93,13 +105,10 @@ export class GiteeAPI {
 
 	/**
 	 * The tree endpoint returns 404 both for "repo missing/no permission" and
-	 * "branch missing", so on a 404 ask the repository metadata (and, for empty
-	 * repos, the branch list) which case we are in.
-	 *
-	 * @returns The default branch to retry with, or `null` when the caller
-	 *          should surface the original 404.
+	 * "branch missing", so on a 404 ask the repository metadata and branch list
+	 * which case we are in.
 	 */
-	private async resolveBranchFallback(): Promise<string | null> {
+	private async readRepoState(): Promise<{ defaultBranch?: string; branchCount: number | null }> {
 		let meta: any;
 		try {
 			meta = await this.request(`/repos/${this.owner}/${this.repo}`);
@@ -112,11 +121,9 @@ export class GiteeAPI {
 			log.log(
 				`读取仓库信息失败（${err instanceof Error ? err.message : String(err)}），保留原始分支错误`,
 			);
-			return null;
+			return { branchCount: null };
 		}
 
-		// Empty repository: no branch can be read or written until the web UI
-		// creates the first commit.
 		let branchCount: number | null = null;
 		try {
 			const list = await this.request(`/repos/${this.owner}/${this.repo}/branches`);
@@ -124,34 +131,68 @@ export class GiteeAPI {
 		} catch {
 			/* fall back to default_branch below */
 		}
-		if (branchCount === 0) {
-			throw new Error(
-				`Gitee 仓库 ${this.owner}/${this.repo} 为空（无任何分支/提交），无法读取文件树：`
-				+ '请先在 Gitee 网页上完成一次初始化提交（例如创建 README）后再重试',
-			);
+		return { defaultBranch: meta?.default_branch || undefined, branchCount };
+	}
+
+	/**
+	 * Bootstrap an empty repository through the Contents API: creating
+	 * `README.md` produces the first commit. `POST /branches` is unusable here
+	 * because it requires an existing `refs` start point.
+	 *
+	 * Runs at most once per instance. On failure the error is cached so later
+	 * sync rounds never write again.
+	 */
+	private async initializeEmptyRepository(defaultBranch?: string): Promise<void> {
+		if (this.autoInitialized) return;
+		if (this.autoInitError) throw this.autoInitError;
+
+		const targetBranch = this.configuredBranch || defaultBranch || 'master';
+		const content = `# ${this.repo}\n\n由 zen-fs 初始化\n`;
+		try {
+			await this.request(`/repos/${this.owner}/${this.repo}/contents/README.md?branch=${targetBranch}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					content: encodeBase64(new TextEncoder().encode(content)),
+					message: 'chore: 初始化仓库（zen-fs 自动创建）',
+				}),
+			});
+		} catch (err) {
+			const status = GiteeAPI.httpStatus(err);
+			const detail = err instanceof Error ? err.message : String(err);
+			const readable =
+				status === 403
+					? new Error(
+						`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化被拒绝：token 缺少写入权限（需要 projects 读写权限）`,
+					)
+					: status === 404
+						? new Error(
+							`Gitee 仓库 ${this.owner}/${this.repo} 不存在或无权访问，无法自动初始化`,
+						)
+						: new Error(`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化失败：${detail}`);
+			this.autoInitError = readable;
+			throw readable;
 		}
 
-		const defaultBranch: string | undefined = meta?.default_branch || undefined;
-		if (!defaultBranch || defaultBranch === this.branch) {
-			log.log(
-				`指定分支 '${this.branch}' 不存在，且没有可用的默认分支（仓库未返回 default_branch），保留原始错误`,
-			);
-			return null;
-		}
-		log.log(`指定分支 '${this.branch}' 不存在，已回落到默认分支 '${defaultBranch}'`);
-		return defaultBranch;
+		this.autoInitialized = true;
+		this.resolvedBranch = targetBranch;
+		log.log(`仓库为空，已自动创建初始提交（分支 ${targetBranch}）`);
 	}
 
 	async request(path: string, init?: RequestInit): Promise<any> {
 		const separator = path.includes('?') ? '&' : '?';
 		const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
-		verboseLog(`request: ${init?.method || 'GET'} ${url}`);
+		// Never let the token leak into logs (verbose tracing or error bodies).
+		const mask = (value: string | undefined) =>
+			(!value || !this.token ? value ?? '' : value.split(this.token).join('***'));
+		verboseLog(`request: ${init?.method || 'GET'} ${mask(url)}`);
 		const response = await fetch(url, init);
-		verboseLog(`response: status=${response.status} url=${response.url} type=${response.headers.get('content-type')}`);
+		verboseLog(`response: status=${response.status} url=${mask(response.url)} type=${response.headers.get('content-type')}`);
 		if (!response.ok) {
 			const text = await response.text().catch(() => '');
-			log.log(`ERROR body: ${text.substring(0, 500)}`);
-			throw new Error(`Gitee API ${response.status}: ${text}`);
+			const safeText = mask(text);
+			log.log(`ERROR body: ${safeText.substring(0, 500)}`);
+			throw new Error(`Gitee API ${response.status}: ${safeText}`);
 		}
 		if (response.status === 204) return undefined;
 		const contentType = response.headers.get('content-type') || '';
@@ -173,11 +214,36 @@ export class GiteeAPI {
 			return data.tree || [];
 		} catch (err) {
 			if (GiteeAPI.httpStatus(err) !== 404) throw err;
-			const fallback = await this.resolveBranchFallback();
-			if (!fallback) throw err;
-			const data = await this.request(treePath(fallback));
-			this.resolvedBranch = fallback;
-			return data.tree || [];
+
+			const state = await this.readRepoState();
+			if (state.branchCount === 0) {
+				// Empty repository: bootstrap it once, then read the freshly created tree.
+				await this.initializeEmptyRepository(state.defaultBranch);
+				try {
+					const data = await this.request(treePath(this.currentBranch));
+					return data.tree || [];
+				} catch (retryErr) {
+					if (GiteeAPI.httpStatus(retryErr) === 404) {
+						throw new Error(
+							`Gitee 仓库 ${this.owner}/${this.repo} 为空，自动初始化后仍无法读取文件树（分支 '${this.currentBranch}'）`,
+						);
+					}
+					throw retryErr;
+				}
+			}
+
+			const defaultBranch = state.defaultBranch;
+			if (defaultBranch && defaultBranch !== this.branch) {
+				log.log(`指定分支 '${this.branch}' 不存在，已回落到默认分支 '${defaultBranch}'`);
+				this.resolvedBranch = defaultBranch;
+				const data = await this.request(treePath(defaultBranch));
+				return data.tree || [];
+			}
+
+			log.log(
+				`指定分支 '${this.branch}' 不存在，且没有可用的默认分支（仓库未返回 default_branch），保留原始错误`,
+			);
+			throw err;
 		}
 	}
 
@@ -251,10 +317,16 @@ export class GiteeAPI {
 				});
 			return data?.content?.sha || '';
 		} catch (err) {
-			if (GiteeAPI.httpStatus(err) === 404) {
+			const status = GiteeAPI.httpStatus(err);
+			if (status === 403) {
 				throw new Error(
-					`Gitee 仓库 ${this.owner}/${this.repo} 无法写入：分支 '${this.currentBranch}' 不存在或仓库为空。`
-					+ '若仓库为空，请先在 Gitee 网页上完成一次初始化提交（例如创建 README）后再写入',
+					`Gitee 仓库 ${this.owner}/${this.repo} 无法写入：token 缺少写入权限（需要 projects 读写权限）`,
+				);
+			}
+			if (status === 404) {
+				throw new Error(
+					`Gitee 仓库 ${this.owner}/${this.repo} 无法写入：分支 '${this.currentBranch}' 不存在或仓库为空`
+					+ '（自动初始化未完成，请查看同步日志中的初始化错误）',
 				);
 			}
 			throw err;

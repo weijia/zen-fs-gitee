@@ -89,22 +89,104 @@ describe('GiteeAPI branch fallback', () => {
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
 	});
 
-	it('empty repository produces an initialization hint', async () => {
+	it('empty repository is bootstrapped with an initial commit, then the tree is readable', async () => {
+		const logs: string[] = [];
+		vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+			logs.push(args.map((a) => String(a)).join(' '));
+		});
 		fetchSpy
 			.mockResolvedValueOnce(jsonError(404)) // tree
-			.mockResolvedValueOnce(jsonOk({ default_branch: 'master' })) // repo meta
-			.mockResolvedValueOnce(jsonOk([])); // no branches
+			.mockResolvedValueOnce(jsonOk({ default_branch: null })) // repo meta (empty repo)
+			.mockResolvedValueOnce(jsonOk([])) // no branches
+			.mockResolvedValueOnce(jsonOk({ content: { sha: 'init-sha' } }, 201)) // POST README
+			.mockResolvedValueOnce(jsonOk({ tree: [TREE_ITEM] })); // tree after init
 
 		const api = newApi('master');
-		await expect(api.getTree(true)).rejects.toThrow(/为空（无任何分支\/提交）/);
+		const tree = await api.getTree(true);
+
+		expect(tree).toHaveLength(1);
+		expect(api.currentBranch).toBe('master');
+		expect(api.autoInitializedEmptyRepo).toBe(true);
+		expect(fetchSpy).toHaveBeenCalledTimes(5);
+
+		const post = fetchSpy.mock.calls[3];
+		expect(String(post[0])).toContain('/contents/README.md');
+		expect(String(post[0])).toContain('branch=master');
+		expect((post[1] as MockInit)?.method).toBe('POST');
+		const body = JSON.parse(String((post[1] as MockInit)?.body));
+		expect(body.message).toBe('chore: 初始化仓库（zen-fs 自动创建）');
+		const decoded = Buffer.from(body.content, 'base64').toString('utf8');
+		expect(decoded).toContain('由 zen-fs 初始化');
+
+		expect(logs.join('\n')).toContain('仓库为空，已自动创建初始提交（分支 master）');
+		expect(logs.join('\n')).not.toContain('test-token');
 	});
 
-	it('writing to an empty repository returns an initialization hint', async () => {
+	it('existing branches never trigger an initialization write', async () => {
+		fetchSpy
+			.mockResolvedValueOnce(jsonError(404)) // tree @ master
+			.mockResolvedValueOnce(jsonOk({ default_branch: 'main' })) // repo meta
+			.mockResolvedValueOnce(jsonOk([{ name: 'main' }])) // branch exists
+			.mockResolvedValueOnce(jsonOk({ tree: [] })); // tree @ main
+
+		const api = newApi('master');
+		await api.getTree(true);
+
+		const posts = fetchSpy.mock.calls.filter((c) => (c[1] as MockInit)?.method === 'POST');
+		expect(posts).toHaveLength(0);
+		expect(api.autoInitializedEmptyRepo).toBe(false);
+	});
+
+	it('403 on initialization surfaces a readable error and never retries the write', async () => {
+		fetchSpy
+			.mockResolvedValueOnce(jsonError(404)) // tree
+			.mockResolvedValueOnce(jsonOk({ default_branch: null })) // repo meta
+			.mockResolvedValueOnce(jsonOk([])) // no branches
+			.mockResolvedValueOnce(jsonError(403, '{"message":"Forbidden"}'))
+			// second getTree round
+			.mockResolvedValueOnce(jsonError(404))
+			.mockResolvedValueOnce(jsonOk({ default_branch: null }))
+			.mockResolvedValueOnce(jsonOk([]));
+
+		const api = newApi('master');
+		await expect(api.getTree(true)).rejects.toThrow(/缺少写入权限|projects/);
+		await expect(api.getTree(true)).rejects.toThrow(/缺少写入权限|projects/);
+
+		const posts = fetchSpy.mock.calls.filter((c) => (c[1] as MockInit)?.method === 'POST');
+		expect(posts).toHaveLength(1);
+		expect(api.autoInitializedEmptyRepo).toBe(false);
+	});
+
+	it('reports a readable error when the tree is still 404 after initialization', async () => {
+		fetchSpy
+			.mockResolvedValueOnce(jsonError(404)) // tree
+			.mockResolvedValueOnce(jsonOk({ default_branch: null })) // repo meta
+			.mockResolvedValueOnce(jsonOk([])) // no branches
+			.mockResolvedValueOnce(jsonOk({ content: { sha: 'init-sha' } }, 201)) // POST README
+			.mockResolvedValueOnce(jsonError(404)); // tree retry still 404
+
+		const api = newApi('master');
+		await expect(api.getTree(true)).rejects.toThrow(/自动初始化后仍无法读取文件树/);
+	});
+
+	it('never logs the token, even when an error body echoes it', async () => {
+		const logs: string[] = [];
+		vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+			logs.push(args.map((a) => String(a)).join(' '));
+		});
+		fetchSpy.mockResolvedValueOnce(jsonError(500, '{"message":"boom test-token"}'));
+
+		const api = newApi('master');
+		await expect(api.request('/boom')).rejects.toThrow(/boom/);
+		expect(logs.join('\n')).not.toContain('test-token');
+	});
+
+	it('writing to an empty repository returns a readable error pointing at the init failure', async () => {
 		fetchSpy.mockResolvedValueOnce(jsonError(404));
 
 		const api = newApi('master');
 		await expect(api.createFile('/a.txt', new Uint8Array([1]), 'Create a.txt'))
-			.rejects.toThrow(/无法写入[\s\S]*初始化提交/);
+			.rejects.toThrow(/无法写入[\s\S]*自动初始化未完成/);
 	});
 
 	it('falls back only once and reuses the default branch for later calls', async () => {
