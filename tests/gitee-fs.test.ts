@@ -199,6 +199,12 @@ describe('GiteeFS', () => {
 			const [_url, init] = fetchSpy.mock.calls[1];
 			expect(init?.method).toBe('POST');
 			expect(fs.contentCache.get('/new.txt')!).toEqual(data);
+
+			// A normal upload must not pre-create a `.keep` placeholder: Git only
+			// keeps directories through their files, so an eager placeholder would
+			// become a ghost directory once the file is deleted.
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('.keep'))).toBe(false);
 		});
 
 		it('updates existing file via PUT', async () => {
@@ -910,18 +916,58 @@ describe('GiteeFS', () => {
 	});
 
 	describe('mkdir / rmdir — empty directory .keep placeholder', () => {
-		it('mkdir creates an internal .keep placeholder', async () => {
+		it('mkdir no longer creates a .keep placeholder', async () => {
 			fetchSpy.mockResolvedValueOnce(mockTreeResponse([]));
 			await fs.init();
 
-			fetchSpy.mockResolvedValueOnce(mockOkJson({ content: { sha: 'keep-sha' } }));
+			const callsBefore = fetchSpy.mock.calls.length;
 			await fs.mkdir('/newdir');
 
-			// The placeholder must be written internally so the empty directory
-			// survives in Git. It is hidden from readdir(), but present in the index.
-			expect(
-				fs.contentCache.has('/newdir/.keep') || fs.index.has('/newdir/.keep'),
-			).toBe(true);
+			// No placeholder is written, and no API call is made: Git cannot track
+			// empty directories, and an eager `.keep` per directory is what left
+			// ghost directories behind after their files were deleted.
+			expect(fetchSpy.mock.calls.length).toBe(callsBefore);
+			expect(fs.index.has('/newdir')).toBe(true);
+			expect(fs.index.has('/newdir/.keep')).toBe(false);
+			expect(fs.contentCache.has('/newdir/.keep')).toBe(false);
+			expect(await fs.readdir('/newdir')).toEqual([]);
+		});
+
+		it('writing a real file drops a legacy .keep placeholder', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'dir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'dir/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({ content: { sha: 'new-sha' } }));
+			await fs.writeFile('/dir/a.txt', 'hello');
+
+			expect(fs.shaCache.has('/dir/a.txt')).toBe(true);
+			expect(fs.index.has('/dir/.keep')).toBe(false);
+			expect(fs.shaCache.has('/dir/.keep')).toBe(false);
+		});
+
+		it('deleting the last file in a directory also removes .keep', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'dir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'dir/a.txt', type: 'blob', sha: 'a-sha', size: 5, mode: '100644' },
+				{ path: 'dir/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.unlink('/dir/a.txt');
+
+			expect(fs.index.has('/dir/a.txt')).toBe(false);
+			// Legacy placeholder is removed so the empty directory disappears from
+			// the remote instead of being re-created on the next pull.
+			expect(fs.index.has('/dir/.keep')).toBe(false);
+			expect(fs.shaCache.has('/dir/.keep')).toBe(false);
+
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('/contents/dir/a.txt'))).toBe(true);
+			expect(urls.some((u) => u.includes('/contents/dir/.keep'))).toBe(true);
 		});
 
 		it('rmdir removes the internal .keep before deleting the directory', async () => {

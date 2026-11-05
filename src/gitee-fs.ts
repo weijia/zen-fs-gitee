@@ -430,6 +430,11 @@ export class GiteeFS extends IndexFS {
 		// tombstone processors and sync engines to think the file still
 		// exists and repeatedly attempt deletion.
 		this.index.delete(path);
+
+		// If this was the last real file in its directory, drop the legacy
+		// `.keep` placeholder as well — otherwise it keeps the (now empty)
+		// directory alive in Git and the directory reappears on the next pull.
+		await this.dropKeepIfDirBecameEmpty(path);
 	}
 
 	removeSync(path: string): void {
@@ -549,6 +554,12 @@ export class GiteeFS extends IndexFS {
 		// extra commit — and stat()/createSnapshot already ignore it in this mode.
 		if (!this.options.useCommitTimeAsMtime) {
 			await this.writeMtimeSidecar(path, effectiveMtime);
+		}
+
+		// A real file now lives in this directory, so a legacy `.keep`
+		// placeholder (created before the eager-placeholder removal) is stale.
+		if (path !== '.keep' && !sidecarToDataPath(path)) {
+			await this.dropKeepPlaceholder(path);
 		}
 	}
 
@@ -1224,20 +1235,17 @@ export class GiteeFS extends IndexFS {
 				// The base IndexFS.mkdir does `options.mode |= S_IFDIR`, so it
 				// requires a defined options object. Default it for callers that
 				// pass none (e.g. `mkdir('/dir')`).
+				//
+				// No `.keep` placeholder is written here. Git cannot track empty
+				// directories, and pre-creating a placeholder for every directory
+				// (e.g. the sync engine's mkdir before uploading files) leaves a
+				// ghost directory behind once its files are deleted — the remote
+				// `.keep` survives and the directory reappears on the next pull.
+				// Directories only need to exist when they contain files, so the
+				// contents API creates them implicitly. Only the very first commit
+				// of an empty repository still uses `.keep` (see gitee-api).
 				const opts = options ?? { mode: S_IFDIR | 0o755 };
-				const result = await (super.mkdir as (p: string, o?: any) => Promise<any>)(path, opts);
-				// Create an internal `.keep` placeholder so the (otherwise empty)
-				// directory survives in Git. Content is `\n` (matches Gitee's
-				// historical placeholder). Hidden by readdir() above.
-				const keepPath = `${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`;
-				try {
-					if (!(await this.exists(keepPath))) {
-						await this.writeFile(keepPath, '\n');
-					}
-				} catch {
-					// best-effort; directory entry already recorded by super.mkdir
-				}
-				return result;
+				return (super.mkdir as (p: string, o?: any) => Promise<any>)(path, opts);
 			}
 
 			async rmdir(path: string): Promise<void> {
@@ -1251,6 +1259,47 @@ export class GiteeFS extends IndexFS {
 					// no placeholder present
 				}
 				await (super.rmdir as (p: string) => Promise<any>)(path);
+			}
+
+			/** `<dir>/.keep` path for a directory or a file inside it. */
+			private keepPlaceholderPath(dirOrFile: string): string {
+				const dir = dirOrFile.endsWith('/')
+					? dirOrFile.slice(0, -1)
+					: dirOrFile.replace(/\/[^/]+$/, '') || '/';
+				return `${dir === '/' ? '' : dir}/.keep`;
+			}
+
+			/**
+			 * Drop a lingering `.keep` placeholder once a real file is written
+			 * into the directory — the directory no longer needs help to exist,
+			 * and keeping the placeholder would leave a ghost directory behind
+			 * after that file is deleted.
+			 */
+			private async dropKeepPlaceholder(dirOrFile: string): Promise<void> {
+				const keepPath = this.keepPlaceholderPath(dirOrFile);
+				if (keepPath === dirOrFile) return;
+				try {
+					if (await this.exists(keepPath)) {
+						await (super.unlink as (p: string) => Promise<any>)(keepPath);
+					}
+				} catch {
+					// best-effort: never fail a write because of placeholder cleanup
+				}
+			}
+
+			/** After a delete, drop `.keep` when no real entries remain in the directory. */
+			private async dropKeepIfDirBecameEmpty(removedPath: string): Promise<void> {
+				const keepPath = this.keepPlaceholderPath(removedPath);
+				if (keepPath === removedPath) return;
+				try {
+					if (!(await this.exists(keepPath))) return;
+					const dir = keepPath.slice(0, keepPath.lastIndexOf('/')) || '/';
+					const names = await (super.readdir as (p: string) => Promise<string[]>)(dir);
+					if (names.some((n) => n !== '.keep')) return; // real files remain
+					await (super.unlink as (p: string) => Promise<any>)(keepPath);
+				} catch {
+					// best-effort
+				}
 			}
 
 			/**

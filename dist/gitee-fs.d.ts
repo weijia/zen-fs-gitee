@@ -215,6 +215,17 @@ export declare class GiteeFS extends IndexFS {
     readdir(path: string): Promise<string[]>;
     mkdir(path: string, options?: any): Promise<any>;
     rmdir(path: string): Promise<void>;
+    /** `<dir>/.keep` path for a directory or a file inside it. */
+    private keepPlaceholderPath;
+    /**
+     * Drop a lingering `.keep` placeholder once a real file is written
+     * into the directory — the directory no longer needs help to exist,
+     * and keeping the placeholder would leave a ghost directory behind
+     * after that file is deleted.
+     */
+    private dropKeepPlaceholder;
+    /** After a delete, drop `.keep` when no real entries remain in the directory. */
+    private dropKeepIfDirBecameEmpty;
     /**
     * Recursively delete `.mtime` sidecar files whose data file no longer
     * exists in the Gitee repo (orphaned sidecars). Returns the number of
