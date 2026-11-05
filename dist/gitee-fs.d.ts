@@ -110,6 +110,16 @@ export declare class GiteeFS extends IndexFS {
     readySync(): void;
     remove(path: string): Promise<void>;
     removeSync(path: string): void;
+    /**
+     * `unlink()` for hidden sidecars.
+     *
+     * `.mtime` sidecars live only in `shaCache` and are deliberately absent from
+     * the Index, so `IndexFS.unlink()` would throw ENOENT before `remove()` could
+     * delete the blob. Route them straight through the Contents API — this is
+     * what lets a `<dir>/.keep.mtime` / `<file>.mtime` tombstone actually take
+     * effect (zen-fs-config unlinks exactly those paths).
+     */
+    unlink(path: string): Promise<void>;
     read(path: string, buffer: Uint8Array, start: number, end: number): Promise<void>;
     readSync(path: string, buffer: Uint8Array, start: number, end: number): void;
     write(path: string, data: Uint8Array, offset: number, mtimeMs?: number): Promise<void>;
@@ -218,13 +228,30 @@ export declare class GiteeFS extends IndexFS {
     /** `<dir>/.keep` path for a directory or a file inside it. */
     private keepPlaceholderPath;
     /**
+     * Delete only the remote blob for an `.mtime` sidecar (without running
+     * the data-file removal path, which would recurse back into keep cleanup).
+     */
+    private deleteSidecar;
+    /**
+     * Remove the `.keep` placeholder and its `.keep.mtime` sidecar.
+     * `.keep` is hidden from readdir(), so `exists()` may be false while the
+     * sidecar blob is still present; delete it via the sha cache regardless.
+     */
+    private removeKeepArtifacts;
+    /**
+     * Best-effort cleanup of orphaned `.mtime` sidecars left in a directory
+     * whose real files are gone (e.g. `<dir>/.keep.mtime` alone keeping a
+     * ghost directory alive in Git).
+     */
+    private pruneOrphanSidecarsInDir;
+    /**
      * Drop a lingering `.keep` placeholder once a real file is written
      * into the directory — the directory no longer needs help to exist,
      * and keeping the placeholder would leave a ghost directory behind
      * after that file is deleted.
      */
     private dropKeepPlaceholder;
-    /** After a delete, drop `.keep` when no real entries remain in the directory. */
+    /** After a delete, drop `.keep` and its sidecar when no real entries remain. */
     private dropKeepIfDirBecameEmpty;
     /**
     * Recursively delete `.mtime` sidecar files whose data file no longer

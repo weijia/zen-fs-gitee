@@ -7,6 +7,7 @@ import {
 	isMtimeSidecar,
 	shaHash,
 	sidecarToDataPath,
+	isKeepPlaceholderSidecar,
 } from '../src/utils.js';
 
 describe('utils', () => {
@@ -149,6 +150,20 @@ describe('utils', () => {
 
 		it('reverses a dotfile sidecar (.keep.mtime) back to the dotfile', () => {
 			expect(sidecarToDataPath('/nodes/.keep.mtime')).toBe('/nodes/.keep');
+		});
+	});
+
+	describe('isKeepPlaceholderSidecar', () => {
+		it('matches the sidecar of the .keep placeholder in any directory', () => {
+			expect(isKeepPlaceholderSidecar('.keep.mtime')).toBe(true);
+			expect(isKeepPlaceholderSidecar('/nodes/.keep.mtime')).toBe(true);
+			expect(isKeepPlaceholderSidecar('app_data/.keep.mtime')).toBe(true);
+		});
+
+		it('does not match data files or other sidecars', () => {
+			expect(isKeepPlaceholderSidecar('/nodes/.keep')).toBe(false);
+			expect(isKeepPlaceholderSidecar('/nodes/x.json.mtime')).toBe(false);
+			expect(isKeepPlaceholderSidecar('/nodes/.keep.mtime.bak')).toBe(false);
 		});
 	});
 });

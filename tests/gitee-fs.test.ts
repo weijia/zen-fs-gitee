@@ -983,5 +983,102 @@ describe('GiteeFS', () => {
 			expect(fs.shaCache.has('/newdir/.keep')).toBe(false);
 			expect(fs.index.has('/newdir')).toBe(false);
 		});
+
+		it('deleting the last file also removes the .keep.mtime sidecar', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'dir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'dir/a.txt', type: 'blob', sha: 'a-sha', size: 5, mode: '100644' },
+				{ path: 'dir/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+				{ path: 'dir/.keep.mtime', type: 'blob', sha: 'keep-mtime-sha', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.unlink('/dir/a.txt');
+
+			// Both the placeholder AND its sidecar must be gone: the sidecar is a
+			// real Git blob and would keep the (now empty) directory alive.
+			expect(fs.index.has('/dir/.keep')).toBe(false);
+			expect(fs.shaCache.has('/dir/.keep')).toBe(false);
+			expect(fs.shaCache.has('/dir/.keep.mtime')).toBe(false);
+
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('/contents/dir/.keep.mtime'))).toBe(true);
+		});
+
+		it('rmdir removes .keep and its .keep.mtime sidecar', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'newdir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'newdir/.keep', type: 'blob', sha: 'keep-sha', size: 1, mode: '100644' },
+				{ path: 'newdir/.keep.mtime', type: 'blob', sha: 'keep-mtime-sha', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.rmdir('/newdir');
+
+			expect(fs.index.has('/newdir')).toBe(false);
+			expect(fs.shaCache.has('/newdir/.keep')).toBe(false);
+			expect(fs.shaCache.has('/newdir/.keep.mtime')).toBe(false);
+		});
+
+		it('rmdir prunes a ghost directory that only holds .keep.mtime', async () => {
+			// Real-world residue: `.keep` was deleted earlier, the sidecar survived
+			// and alone keeps the directory present in Git.
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'app_data', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'app_data/.keep.mtime', type: 'blob', sha: 'ghost-sha', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.rmdir('/app_data');
+
+			expect(fs.index.has('/app_data')).toBe(false);
+			expect(fs.shaCache.has('/app_data/.keep.mtime')).toBe(false);
+
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('/contents/app_data/.keep.mtime'))).toBe(true);
+		});
+
+		it('unlink() can delete a hidden .mtime sidecar path (tombstone path)', async () => {
+			// zen-fs-config tombstones `<dir>/.keep.mtime` and unlinks it directly.
+			// Sidecars are not in the Index, so IndexFS.unlink() would throw ENOENT
+			// before reaching the backend.
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'app_data', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'app_data/.keep.mtime', type: 'blob', sha: 'ghost-sha', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			expect(fs.index.has('/app_data/.keep.mtime')).toBe(false);
+			expect(fs.shaCache.has('/app_data/.keep.mtime')).toBe(true);
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.unlink('/app_data/.keep.mtime');
+
+			expect(fs.shaCache.has('/app_data/.keep.mtime')).toBe(false);
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('/contents/app_data/.keep.mtime'))).toBe(true);
+		});
+
+		it('deleting a normal file also removes its .mtime sidecar', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'dir', type: 'tree', sha: 'tree-sha', mode: '040000' },
+				{ path: 'dir/a.txt', type: 'blob', sha: 'a-sha', size: 5, mode: '100644' },
+				{ path: 'dir/a.txt.mtime', type: 'blob', sha: 'a-mtime-sha', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			fetchSpy.mockResolvedValue(mockOkJson({}));
+			await fs.unlink('/dir/a.txt');
+
+			expect(fs.index.has('/dir/a.txt')).toBe(false);
+			expect(fs.shaCache.has('/dir/a.txt')).toBe(false);
+			expect(fs.shaCache.has('/dir/a.txt.mtime')).toBe(false);
+
+			const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+			expect(urls.some((u) => u.includes('/contents/dir/a.txt.mtime'))).toBe(true);
+		});
 	});
 });

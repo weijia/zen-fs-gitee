@@ -158,3 +158,18 @@ export function isDoubleDotFile(name: string): boolean {
 export function isMetadataSidecarToDelete(name: string): boolean {
 	return isDotMetaSidecar(name) || isDoubleDotFile(name);
 }
+
+/**
+ * `<dir>/.keep.mtime` — the mtime sidecar of the backend-internal `.keep`
+ * placeholder. `.keep` is hidden from readdir()/createSnapshot(), but its
+ * sidecar is a real Git file; if it survives a directory delete, Git keeps the
+ * directory alive and it reappears on the next pull.
+ *
+ * Path-based on purpose: tree entries are repo-relative paths (e.g.
+ * `app_data/.keep.mtime`), not basenames.
+ */
+export function isKeepPlaceholderSidecar(nameOrPath: string): boolean {
+	const slash = nameOrPath.lastIndexOf('/');
+	const base = slash >= 0 ? nameOrPath.slice(slash + 1) : nameOrPath;
+	return base === '.keep.mtime';
+}

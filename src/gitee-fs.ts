@@ -26,7 +26,7 @@ function diagLog(...args: unknown[]): void {
   }
 }
 import type { GiteeOptions } from './types.js';
-import { mtimePathFor, sidecarToDataPath, shaHash, apiPath, isMetadataSidecarToDelete, bytesEqual } from './utils.js';
+import { mtimePathFor, sidecarToDataPath, shaHash, apiPath, isMetadataSidecarToDelete, isKeepPlaceholderSidecar, bytesEqual } from './utils.js';
 
 /** TTL (ms) for the negative cache of "path has no .mtime sidecar" — avoids 404 storms. */
 const NO_SIDECAR_TTL_MS = 10 * 60 * 1000;
@@ -467,6 +467,24 @@ export class GiteeFS extends IndexFS {
 		this._deleteMtime(path);
 		// Remove from the in-memory Index — see remove() for explanation.
 		this.index.delete(path);
+	}
+
+	/**
+	 * `unlink()` for hidden sidecars.
+	 *
+	 * `.mtime` sidecars live only in `shaCache` and are deliberately absent from
+	 * the Index, so `IndexFS.unlink()` would throw ENOENT before `remove()` could
+	 * delete the blob. Route them straight through the Contents API — this is
+	 * what lets a `<dir>/.keep.mtime` / `<file>.mtime` tombstone actually take
+	 * effect (zen-fs-config unlinks exactly those paths).
+	 */
+	async unlink(path: string): Promise<void> {
+		if (path.endsWith('.mtime') && !this.index.has(path)) {
+			const deleted = await this.deleteSidecar(path);
+			if (!deleted) throw withErrno('ENOENT');
+			return;
+		}
+		await super.unlink(path);
 	}
 
 	// --- Read ---
@@ -1029,11 +1047,12 @@ export class GiteeFS extends IndexFS {
 			// isMtimeSidecar(item.path), which fails on directory-prefixed paths).
 			// Dot-prefixed metadata sidecars (`.name.mtime` / `.name.version`) use
 			// a different data-path mapping and are NOT included here — they are
-			// handled by the dot-meta prune pass below.
+			// handled by the dot-meta prune pass below. Same for the internal
+			// `<dir>/.keep.mtime` placeholder sidecar.
 			const sidecarByData = new Map<string, string>();
 			for (const item of tree) {
 				if (item.type === 'tree') continue;
-				if (isMetadataSidecarToDelete(item.path)) continue;
+				if (isMetadataSidecarToDelete(item.path) || isKeepPlaceholderSidecar(item.path)) continue;
 				const dataPath = sidecarToDataPath(item.path);
 				if (dataPath) sidecarByData.set('/' + dataPath, '/' + item.path);
 			}
@@ -1176,6 +1195,10 @@ export class GiteeFS extends IndexFS {
 				if (item.type === 'tree') continue;
 				if (isMetadataSidecarToDelete(item.path)) {
 					metadataSidecars.push({ path: item.path, sha: item.sha });
+				} else if (isKeepPlaceholderSidecar(item.path)) {
+					// `<dir>/.keep.mtime` must always go: `.keep` is hidden, so its
+					// sidecar is invisible to the normal orphaned-sidecar logic.
+					metadataSidecars.push({ path: item.path, sha: item.sha });
 				} else {
 					const dataPath = sidecarToDataPath(item.path);
 					if (dataPath) suffixSidecars.push({ path: item.path, sha: item.sha });
@@ -1249,15 +1272,20 @@ export class GiteeFS extends IndexFS {
 			}
 
 			async rmdir(path: string): Promise<void> {
-				// Remove the internal `.keep` first so the directory is empty before
-				// the base class removes its entry.
+				const dir = path.endsWith('/') ? path.slice(0, -1) : path;
+				let realEntriesRemain = true;
 				try {
-					await (super.unlink as (p: string) => Promise<any>)(
-						`${path.endsWith('/') ? path.slice(0, -1) : path}/.keep`,
-					);
+					const names = await (super.readdir as (p: string) => Promise<string[]>)(dir);
+					realEntriesRemain = names.some((n) => n !== '.keep');
 				} catch {
-					// no placeholder present
+					// Directory not in the index — it only exists remotely via sidecars.
+					realEntriesRemain = false;
 				}
+				// Remove `.keep` AND `<dir>/.keep.mtime` (plus any orphaned sidecars)
+				// before the base class drops the directory entry. Otherwise Git keeps
+				// the directory alive through the sidecar and it reappears on pull.
+				await this.removeKeepArtifacts(dir);
+				if (!realEntriesRemain) await this.pruneOrphanSidecarsInDir(dir);
 				await (super.rmdir as (p: string) => Promise<any>)(path);
 			}
 
@@ -1270,6 +1298,67 @@ export class GiteeFS extends IndexFS {
 			}
 
 			/**
+			 * Delete only the remote blob for an `.mtime` sidecar (without running
+			 * the data-file removal path, which would recurse back into keep cleanup).
+			 */
+			private async deleteSidecar(path: string): Promise<boolean> {
+				const sha = this.shaCache.get(path);
+				if (!sha) return false;
+				await this.api.deleteFile(path, sha, `Delete mtime sidecar ${path}`);
+				this.shaCache.delete(path);
+				this._deleteSha(path);
+				this._deleteContent(path);
+				this._deleteMtime(path);
+				this.mtimeCache.delete(path);
+				return true;
+			}
+
+			/**
+			 * Remove the `.keep` placeholder and its `.keep.mtime` sidecar.
+			 * `.keep` is hidden from readdir(), so `exists()` may be false while the
+			 * sidecar blob is still present; delete it via the sha cache regardless.
+			 */
+			private async removeKeepArtifacts(dir: string): Promise<void> {
+				const keepPath = `${dir === '/' ? '' : dir}/.keep`;
+				try {
+					if (await this.exists(keepPath)) {
+						await (super.unlink as (p: string) => Promise<any>)(keepPath);
+					}
+				} catch {
+					// best-effort
+				}
+				try {
+					await this.deleteSidecar(mtimePathFor(keepPath));
+				} catch {
+					// best-effort
+				}
+			}
+
+			/**
+			 * Best-effort cleanup of orphaned `.mtime` sidecars left in a directory
+			 * whose real files are gone (e.g. `<dir>/.keep.mtime` alone keeping a
+			 * ghost directory alive in Git).
+			 */
+			private async pruneOrphanSidecarsInDir(dir: string): Promise<void> {
+				const prefix = dir === '/' ? '/' : `${dir}/`;
+				for (const full of Array.from(this.shaCache.keys())) {
+					if (!full.startsWith(prefix)) continue;
+					const rel = full.slice(prefix.length);
+					if (!rel || rel.includes('/')) continue;
+					if (this.index.has(full)) continue;
+					const mapped = sidecarToDataPath(full);
+					if (!mapped) continue;
+					const dataPath = mapped.startsWith('/') ? mapped : `/${mapped}`;
+					if (this.index.has(dataPath)) continue;
+					try {
+						await this.deleteSidecar(full);
+					} catch (e) {
+						log.warn(`pruneOrphanSidecarsInDir(${dir}): failed to delete ${full}:`, e);
+					}
+				}
+			}
+
+			/**
 			 * Drop a lingering `.keep` placeholder once a real file is written
 			 * into the directory — the directory no longer needs help to exist,
 			 * and keeping the placeholder would leave a ghost directory behind
@@ -1278,25 +1367,27 @@ export class GiteeFS extends IndexFS {
 			private async dropKeepPlaceholder(dirOrFile: string): Promise<void> {
 				const keepPath = this.keepPlaceholderPath(dirOrFile);
 				if (keepPath === dirOrFile) return;
+				const dir = keepPath.slice(0, keepPath.lastIndexOf('/')) || '/';
 				try {
-					if (await this.exists(keepPath)) {
-						await (super.unlink as (p: string) => Promise<any>)(keepPath);
-					}
+					await this.removeKeepArtifacts(dir);
 				} catch {
 					// best-effort: never fail a write because of placeholder cleanup
 				}
 			}
 
-			/** After a delete, drop `.keep` when no real entries remain in the directory. */
+			/** After a delete, drop `.keep` and its sidecar when no real entries remain. */
 			private async dropKeepIfDirBecameEmpty(removedPath: string): Promise<void> {
 				const keepPath = this.keepPlaceholderPath(removedPath);
 				if (keepPath === removedPath) return;
+				const dir = keepPath.slice(0, keepPath.lastIndexOf('/')) || '/';
 				try {
-					if (!(await this.exists(keepPath))) return;
-					const dir = keepPath.slice(0, keepPath.lastIndexOf('/')) || '/';
 					const names = await (super.readdir as (p: string) => Promise<string[]>)(dir);
-					if (names.some((n) => n !== '.keep')) return; // real files remain
-					await (super.unlink as (p: string) => Promise<any>)(keepPath);
+					// `<dir>/.keep.mtime` is internal metadata, not a real entry: counting
+					// it as content would keep `.keep` (and therefore the directory) alive.
+					const hasRealEntries = names.some((n) => n !== '.keep' && !isKeepPlaceholderSidecar(n));
+					if (hasRealEntries) return;
+					await this.removeKeepArtifacts(dir);
+					await this.pruneOrphanSidecarsInDir(dir);
 				} catch {
 					// best-effort
 				}
@@ -1321,12 +1412,29 @@ export class GiteeFS extends IndexFS {
 				// are deleted by {@link deleteMetadataSidecars} (and on the fly in
 				// init/createSnapshot), so skip them here to avoid mis-mapping
 				// (`.note.json.mtime` would wrongly resolve to `.note.json`).
-				if (isMetadataSidecarToDelete(item.path)) continue;
+				// `<dir>/.keep.mtime` is equally stale internal metadata.
+				if (isMetadataSidecarToDelete(item.path) || isKeepPlaceholderSidecar(item.path)) continue;
 				const dataPath = sidecarToDataPath(item.path);
 				if (dataPath) sidecarItems.push({ path: item.path, sha: item.sha });
 				else allDataPaths.add(item.path);
 			}
 			let removed = 0;
+			// `<dir>/.keep.mtime` is the sidecar of the hidden `.keep` placeholder;
+			// it is not visible to the orphaned-sidecar mapping below, so remove it
+			// unconditionally (it must never keep a directory alive on its own).
+			for (const item of tree) {
+				if (item.type === 'tree' || !isKeepPlaceholderSidecar(item.path)) continue;
+				if (normalizedRoot && item.path !== normalizedRoot && !item.path.startsWith(normalizedRoot + '/')) continue;
+				const full = '/' + item.path;
+				try {
+					await this.api.deleteFile(full, item.sha, `Prune keep placeholder sidecar ${full}`);
+					this.shaCache.delete(full);
+					this._deleteSha(full);
+					removed++;
+				} catch (e) {
+					log.warn(`pruneOrphanedMtimeSidecars: failed to delete ${full}:`, e);
+				}
+			}
 			for (const sc of sidecarItems) {
 				if (normalizedRoot && sc.path !== normalizedRoot && !sc.path.startsWith(normalizedRoot + '/')) continue;
 				const dataPath = sidecarToDataPath(sc.path)!;
@@ -1366,7 +1474,7 @@ export class GiteeFS extends IndexFS {
 			for (const item of tree) {
 				if (item.type === 'tree') continue;
 				if (normalizedRoot && item.path !== normalizedRoot && !item.path.startsWith(normalizedRoot + '/')) continue;
-				if (!isMetadataSidecarToDelete(item.path)) continue;
+				if (!isMetadataSidecarToDelete(item.path) && !isKeepPlaceholderSidecar(item.path)) continue;
 				const full = '/' + item.path;
 				try {
 					await this.api.deleteFile(full, item.sha, `Delete dot-meta sidecar ${full}`);

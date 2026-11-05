@@ -77,4 +77,14 @@ export declare function isDoubleDotFile(name: string): boolean;
  * `..`-prefixed file. Used by `init()` / `createSnapshot()` cleanup.
  */
 export declare function isMetadataSidecarToDelete(name: string): boolean;
+/**
+ * `<dir>/.keep.mtime` — the mtime sidecar of the backend-internal `.keep`
+ * placeholder. `.keep` is hidden from readdir()/createSnapshot(), but its
+ * sidecar is a real Git file; if it survives a directory delete, Git keeps the
+ * directory alive and it reappears on the next pull.
+ *
+ * Path-based on purpose: tree entries are repo-relative paths (e.g.
+ * `app_data/.keep.mtime`), not basenames.
+ */
+export declare function isKeepPlaceholderSidecar(nameOrPath: string): boolean;
 //# sourceMappingURL=utils.d.ts.map
