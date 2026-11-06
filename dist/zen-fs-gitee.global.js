@@ -18793,7 +18793,7 @@ var ZenFSGitee = (() => {
       this.resolvedBranch = targetBranch;
       log2.log(`\u4ED3\u5E93\u4E3A\u7A7A\uFF0C\u5DF2\u81EA\u52A8\u521B\u5EFA\u521D\u59CB\u63D0\u4EA4\uFF08\u5206\u652F ${targetBranch}\uFF09`);
     }
-    async request(path, init2) {
+    async request(path, init2, opts) {
       const separator = path.includes("?") ? "&" : "?";
       const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
       const mask = (value) => !value || !this.token ? value ?? "" : value.split(this.token).join("***");
@@ -18803,7 +18803,9 @@ var ZenFSGitee = (() => {
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         const safeText = mask(text);
-        log2.log(`ERROR body: ${safeText.substring(0, 500)}`);
+        if (!(opts?.quiet404 && response.status === 404)) {
+          log2.log(`ERROR body: ${safeText.substring(0, 500)}`);
+        }
         throw new Error(`Gitee API ${response.status}: ${safeText}`);
       }
       if (response.status === 204) return void 0;
@@ -18891,8 +18893,16 @@ var ZenFSGitee = (() => {
     async getContents(path) {
       return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.currentBranch}`);
     }
-    async getRaw(path) {
-      return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.currentBranch}`);
+    /**
+     * Read a raw file. `quiet404` marks an existence probe (e.g. an `.mtime`
+     * sidecar check) where a 404 is an expected answer, not an error to log.
+     */
+    async getRaw(path, opts) {
+      return this.request(
+        `/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.currentBranch}`,
+        void 0,
+        opts
+      );
     }
     /**
      * Create a new file via Contents API. Returns the new blob SHA.
@@ -19625,7 +19635,7 @@ var ZenFSGitee = (() => {
       const neg = this.noSidecarCache.get(path);
       if (neg === void 0 || Date.now() - neg > NO_SIDECAR_TTL_MS) {
         try {
-          const sidecarData = this.contentCache.get(sidecarPath) || await this.api.getRaw(sidecarPath);
+          const sidecarData = this.contentCache.get(sidecarPath) || await this.api.getRaw(sidecarPath, { quiet404: true });
           const sidecarBytes = sidecarData instanceof Uint8Array ? sidecarData : new Uint8Array(sidecarData);
           if (!this.contentCache.has(sidecarPath)) {
             this.contentCache.set(sidecarPath, sidecarBytes);
@@ -19647,7 +19657,7 @@ var ZenFSGitee = (() => {
         }
       }
       if (currentSha) {
-        const commit = await this.api.getLastCommit(path);
+        const commit = await this.api.getLastCommit(path).catch(() => null);
         if (commit) {
           const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
           this.mtimeCache.set(path, mtimeEntry);
@@ -19939,7 +19949,7 @@ var ZenFSGitee = (() => {
     // ---------------------------------------------------------------------
     async readdir(path) {
       const names = await super.readdir(path);
-      return names.filter((n) => n !== ".keep");
+      return names.filter((n) => n !== ".keep" && !n.endsWith(".mtime"));
     }
     async mkdir(path, options) {
       const opts = options ?? { mode: S_IFDIR | 493 };

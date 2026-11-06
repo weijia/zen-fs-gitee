@@ -369,6 +369,21 @@ describe('GiteeFS', () => {
 			expect(entries).toContain('a.ts');
 			expect(entries).not.toContain('.keep');
 		});
+
+		it('hides .mtime sidecars from async readdir (snapshot walkers must not stat them)', async () => {
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'src', type: 'tree', sha: 't1', mode: '040000' },
+				{ path: 'src/a.ts', type: 'blob', sha: 'b1', size: 1, mode: '100644' },
+				{ path: 'src/a.ts.mtime', type: 'blob', sha: 'm1', size: 20, mode: '100644' },
+				{ path: 'src/a.ts.mtime.mtime', type: 'blob', sha: 'm2', size: 20, mode: '100644' },
+			]));
+			await fs.init();
+
+			const entries = await fs.readdir('/src');
+			expect(entries).toContain('a.ts');
+			expect(entries).not.toContain('a.ts.mtime');
+			expect(entries).not.toContain('a.ts.mtime.mtime');
+		});
 	});
 
 	describe('stat', () => {

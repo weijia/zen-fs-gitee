@@ -197,7 +197,7 @@ export class GiteeAPI {
 		log.log(`仓库为空，已自动创建初始提交（分支 ${targetBranch}）`);
 	}
 
-	async request(path: string, init?: RequestInit): Promise<any> {
+	async request(path: string, init?: RequestInit, opts?: { quiet404?: boolean }): Promise<any> {
 		const separator = path.includes('?') ? '&' : '?';
 		const url = `${this.baseUrl}${path}${separator}access_token=${this.token}`;
 		// Never let the token leak into logs (verbose tracing or error bodies).
@@ -209,7 +209,12 @@ export class GiteeAPI {
 		if (!response.ok) {
 			const text = await response.text().catch(() => '');
 			const safeText = mask(text);
-			log.log(`ERROR body: ${safeText.substring(0, 500)}`);
+			// A 404 can be an expected probe (e.g. "does this .mtime sidecar
+			// exist?"). Callers that legitimately expect it pass quiet404 so the
+			// console is not flooded with false alarms.
+			if (!(opts?.quiet404 && response.status === 404)) {
+				log.log(`ERROR body: ${safeText.substring(0, 500)}`);
+			}
 			throw new Error(`Gitee API ${response.status}: ${safeText}`);
 		}
 		if (response.status === 204) return undefined;
@@ -310,8 +315,16 @@ export class GiteeAPI {
 		return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.currentBranch}`);
 	}
 
-	async getRaw(path: string): Promise<ArrayBuffer> {
-		return this.request(`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.currentBranch}`);
+	/**
+	 * Read a raw file. `quiet404` marks an existence probe (e.g. an `.mtime`
+	 * sidecar check) where a 404 is an expected answer, not an error to log.
+	 */
+	async getRaw(path: string, opts?: { quiet404?: boolean }): Promise<ArrayBuffer> {
+		return this.request(
+			`/repos/${this.owner}/${this.repo}/raw/${apiPath(path)}?ref=${this.currentBranch}`,
+			undefined,
+			opts,
+		);
 	}
 
 	/**

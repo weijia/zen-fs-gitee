@@ -73,7 +73,9 @@ export declare class GiteeAPI {
      * sync rounds never write again.
      */
     private initializeEmptyRepository;
-    request(path: string, init?: RequestInit): Promise<any>;
+    request(path: string, init?: RequestInit, opts?: {
+        quiet404?: boolean;
+    }): Promise<any>;
     getTree(recursive?: boolean): Promise<GiteeTreeItem[]>;
     /**
      * Get the latest commit SHA of a branch.
@@ -93,7 +95,13 @@ export declare class GiteeAPI {
      */
     createBranch(newBranch: string, fromRef?: string): Promise<void>;
     getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]>;
-    getRaw(path: string): Promise<ArrayBuffer>;
+    /**
+     * Read a raw file. `quiet404` marks an existence probe (e.g. an `.mtime`
+     * sidecar check) where a 404 is an expected answer, not an error to log.
+     */
+    getRaw(path: string, opts?: {
+        quiet404?: boolean;
+    }): Promise<ArrayBuffer>;
     /**
      * Create a new file via Contents API. Returns the new blob SHA.
      * Gitee rejects empty content with "content is empty", so empty files

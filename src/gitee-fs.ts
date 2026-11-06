@@ -809,7 +809,7 @@ export class GiteeFS extends IndexFS {
 		if (neg === undefined || Date.now() - neg > NO_SIDECAR_TTL_MS) {
 			try {
 				const sidecarData = this.contentCache.get(sidecarPath)
-					|| (await this.api.getRaw(sidecarPath)) as ArrayBuffer;
+					|| (await this.api.getRaw(sidecarPath, { quiet404: true })) as ArrayBuffer;
 				const sidecarBytes = sidecarData instanceof Uint8Array
 					? sidecarData
 					: new Uint8Array(sidecarData);
@@ -840,7 +840,9 @@ export class GiteeFS extends IndexFS {
 		//    cycles without a confirming negative entry, allowing re-detection
 		//    of a sidecar that appears later.
 		if (currentSha) {
-			const commit = await this.api.getLastCommit(path);
+			// A commit lookup failure must not fail stat(): the caller can still
+			// use the base inode. Only the mtime enrichment is skipped.
+			const commit = await this.api.getLastCommit(path).catch(() => null);
 			if (commit) {
 				const mtimeEntry = { sha: currentSha, lastModified: commit.date, fromSidecar: false };
 				this.mtimeCache.set(path, mtimeEntry);
@@ -1251,7 +1253,13 @@ export class GiteeFS extends IndexFS {
 
 			async readdir(path: string): Promise<string[]> {
 				const names = await super.readdir(path);
-				return names.filter((n) => n !== '.keep');
+				// Hide backend-internal metadata from directory listings:
+				//   · `.keep` — empty-directory placeholder;
+				//   · `*.mtime` — mtime sidecars (and pathological `*.mtime.mtime`).
+				// zen-fs-sync explicitly requires this: a generic snapshot walker
+				// would otherwise stat every sidecar, and each such stat probes
+				// `<sidecar>.mtime` and produces a 404 storm.
+				return names.filter((n) => n !== '.keep' && !n.endsWith('.mtime'));
 			}
 
 			async mkdir(path: string, options?: any): Promise<any> {
