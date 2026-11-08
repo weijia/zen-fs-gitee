@@ -230,7 +230,22 @@ describe('GiteeAPI', () => {
 		expect(JSON.parse(fetchSpy.mock.calls[2][1]?.body as string).sha).toBe('existing-sha');
 	});
 
-	it('createFile rethrows 400 when the path really does not exist', async () => {
+	it('getFileSha returns null when Gitee answers 200 with [] (missing path)', async () => {
+		// Gitee 对“路径不存在”返回 200 []（不是 404），`data?.sha` 会是 undefined
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [],
+			text: async () => '[]',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+
+		await expect(api.getFileSha('/missing.txt')).resolves.toBeNull();
+	});
+
+	it('createFile retries POST after 400 when the path is absent and succeeds', async () => {
+		// 1) POST → 400「文件新建失败」（Gitee 刚删完时的读侧滞后）
 		fetchSpy.mockResolvedValueOnce({
 			ok: false,
 			status: 400,
@@ -239,17 +254,56 @@ describe('GiteeAPI', () => {
 			text: async () => '{"message":"文件新建失败"}',
 			arrayBuffer: async () => new ArrayBuffer(0),
 		} as Response);
-		// getFileSha: 404 → 视为不存在
+		// 2) getFileSha → 200 []（路径确认不存在）
 		fetchSpy.mockResolvedValueOnce({
-			ok: false,
-			status: 404,
-			headers: new Headers({}),
-			json: async () => ({ message: 'Not Found' }),
-			text: async () => 'Not Found',
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [],
+			text: async () => '[]',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+		// 3) 重试 POST → 201 成功
+		fetchSpy.mockResolvedValueOnce({
+			ok: true,
+			status: 201,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ content: { sha: 'created-sha' } }),
+			text: async () => '',
 			arrayBuffer: async () => new ArrayBuffer(0),
 		} as Response);
 
+		const result = await api.createFile('/sidecar.mtime', new TextEncoder().encode('123'), 'create');
+
+		expect(result).toBe('created-sha');
+		expect(fetchSpy.mock.calls[0][1]?.method).toBe('POST');
+		expect(fetchSpy.mock.calls[1][0] as string).toContain('/contents/sidecar.mtime');
+		expect(fetchSpy.mock.calls[2][1]?.method).toBe('POST');
+	});
+
+	it('createFile throws the original 400 only after retries also fail', async () => {
+		const err400 = {
+			ok: false,
+			status: 400,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => ({ message: '文件新建失败' }),
+			text: async () => '{"message":"文件新建失败"}',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response;
+		fetchSpy.mockResolvedValueOnce(err400);            // POST
+		fetchSpy.mockResolvedValueOnce({                   // getFileSha → 200 []
+			ok: true,
+			status: 200,
+			headers: new Headers({ 'content-type': 'application/json' }),
+			json: async () => [],
+			text: async () => '[]',
+			arrayBuffer: async () => new ArrayBuffer(0),
+		} as Response);
+		fetchSpy.mockResolvedValue(err400);                 // 两次重试均 400
+
 		await expect(api.createFile('/new.txt', new TextEncoder().encode('x'), 'create')).rejects.toThrow('Gitee API 400');
+		// 1 次首写 + 2 次重试，全部是 POST
+		expect(fetchSpy.mock.calls.filter((c) => c[1]?.method === 'POST')).toHaveLength(3);
 	});
 
 	it('deleteFile treats a concurrently-deleted file as success (same branch probe)', async () => {

@@ -22,6 +22,14 @@ function verboseLog(...args: unknown[]): void {
   }
 }
 
+/**
+ * Back-off (ms) before retrying a POST that Gitee rejected with 400 while the
+ * path was confirmed absent remotely. Gitee's create endpoint briefly rejects a
+ * path right after its own delete commit (read-side cache lag); one or two
+ * short retries let the commit become visible without touching other files.
+ */
+const CREATE_RETRY_DELAYS_MS = [200, 600];
+
 export interface GiteeTreeItem {
 	path: string;
 	mode: string;
@@ -311,6 +319,15 @@ export class GiteeAPI {
 	// Contents API (GET / POST / PUT / DELETE — all supported by Gitee)
 	// -----------------------------------------------------------------------
 
+	/**
+	 * Read a path through the Contents API.
+	 *
+	 * Gitee answers **200 with an empty array** for a path that does not exist
+	 * (it does not return 404 like GitHub). A path that exists as a file is a
+	 * single object carrying `sha`; a directory is an array of entries. Callers
+	 * that need "does this file exist" must therefore treat an array as
+	 * "not a file" — see {@link getFileSha}.
+	 */
 	async getContents(path: string, branch: string = this.currentBranch): Promise<GiteeContentItem | GiteeContentItem[]> {
 		return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${branch}`);
 	}
@@ -337,15 +354,16 @@ export class GiteeAPI {
 		if (content.length === 0) {
 			content = new TextEncoder().encode('\n');
 		}
+		const postCreate = () => this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				content: encodeBase64(content),
+				message,
+			}),
+			});
 		try {
-			const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					content: encodeBase64(content),
-					message,
-				}),
-				});
+			const data = await postCreate();
 			return data?.content?.sha || '';
 		} catch (err) {
 			const status = GiteeAPI.httpStatus(err);
@@ -370,6 +388,22 @@ export class GiteeAPI {
 					verboseLog(`createFile: ${path} already exists remotely, retrying as PUT update`);
 					return this.updateFile(path, content, existingSha, message);
 				}
+				// 路径确认不存在（Gitee 用 200 + `[]` 表示，getFileSha 已归一为 null）：
+				// 400 只可能是 Gitee 刚处理完删除 / 读侧缓存滞后的误报。此时 PUT 无从
+				// 下手（没有 sha），用短退避重试 POST；仍失败才把原始 400 抛出。
+				let lastError: unknown = err;
+				for (const delayMs of CREATE_RETRY_DELAYS_MS) {
+					await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+					try {
+						const data = await postCreate();
+						verboseLog(`createFile: ${path} created on retry after ${delayMs}ms (400 on first attempt)`);
+						return data?.content?.sha || '';
+					} catch (retryErr) {
+						lastError = retryErr;
+						if (GiteeAPI.httpStatus(retryErr) !== 400) throw retryErr;
+					}
+				}
+				throw lastError;
 			}
 			throw err;
 		}
@@ -466,10 +500,16 @@ export class GiteeAPI {
 
 	/**
 	 * Get the current blob SHA of a file via the Contents API (GET).
+	 *
+	 * Returns `null` when the path is missing. Gitee signals "missing" with
+	 * **200 + `[]`** (not 404), so an array response must be treated as
+	 * "no file here" — otherwise `data?.sha` is `undefined` and a caller such
+	 * as {@link createFile}'s 400 fallback cannot tell "exists" from "gone".
 	 */
-	async getFileSha(path: string): Promise<string | null> {
+	async getFileSha(path: string, branch: string = this.currentBranch): Promise<string | null> {
 		try {
-			const data = await this.getContents(path) as GiteeContentItem;
+			const data = await this.getContents(path, branch);
+			if (Array.isArray(data)) return null; // 目录，或 Gitee 用 `[]` 表示的“不存在”
 			return data?.sha || null;
 		} catch {
 			return null;

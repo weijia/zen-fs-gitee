@@ -653,14 +653,20 @@ export class GiteeFS extends IndexFS {
 		}
 		const sidecarPath = mtimePathFor(path);
 		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
-		const existingSidecarSha = await this.ensureSha(sidecarPath);
-		const newSha = existingSidecarSha
-			? await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
-			: await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
-		this.shaCache.set(sidecarPath, newSha);
-		this._persistSha(sidecarPath, newSha);
-		this.contentCache.set(sidecarPath, sidecarContent);
-		this._persistContent(sidecarPath, sidecarContent);
+		const cachedSidecarSha = this.shaCache.get(sidecarPath);
+		const cachedSidecarContent = this.contentCache.get(sidecarPath);
+		// 幂等：远端 sidecar 内容与本次相同 → 零写入。否则每轮同步都会为同一个
+		// mtime 产生一次内容相同的 commit（history 里 create/delete 交替的根源之一）。
+		if (!(cachedSidecarSha && cachedSidecarContent && bytesEqual(cachedSidecarContent, sidecarContent))) {
+			const existingSidecarSha = cachedSidecarSha ?? await this.ensureSha(sidecarPath);
+			const newSha = existingSidecarSha
+				? await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+				: await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+			this.shaCache.set(sidecarPath, newSha);
+			this._persistSha(sidecarPath, newSha);
+			this.contentCache.set(sidecarPath, sidecarContent);
+			this._persistContent(sidecarPath, sidecarContent);
+		}
 		// Refresh the *data file's* mtime cache so the next stat() immediately
 		// sees the real mtime instead of an ever-changing commit time (which
 		// re-triggers MTIME NORMALIZE). writeMtimeSidecar() bypasses the index,
@@ -688,8 +694,14 @@ export class GiteeFS extends IndexFS {
 		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
 		this._queue(
 			(async () => {
+				// 幂等：远端 sidecar 内容与本次相同 → 零写入（见 writeMtimeSidecar()）。
+				const cachedSidecarSha = this.shaCache.get(sidecarPath);
+				const cachedSidecarContent = this.contentCache.get(sidecarPath);
+				if (cachedSidecarSha && cachedSidecarContent && bytesEqual(cachedSidecarContent, sidecarContent)) {
+					return cachedSidecarSha;
+				}
 				// 冷缓存下先探测远端 sha，避免对已存在的 sidecar 走 POST 撞 400。
-				const existingSidecarSha = this.shaCache.get(sidecarPath) ?? await this.ensureSha(sidecarPath);
+				const existingSidecarSha = cachedSidecarSha ?? await this.ensureSha(sidecarPath);
 				return existingSidecarSha
 					? this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
 					: this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
@@ -958,16 +970,22 @@ export class GiteeFS extends IndexFS {
 		//    create `.file.mtime.mtime`). Mirrors the guard in writeMtimeSidecar().
 		if (sidecarToDataPath(path) === null) {
 			const existingSidecarSha = this.shaCache.get(sidecarPath);
-			let newSidecarSha: string;
-			if (existingSidecarSha) {
-				newSidecarSha = await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`);
-			} else {
-				newSidecarSha = await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+			const cachedSidecarContent = this.contentCache.get(sidecarPath);
+			// 幂等：远端 sidecar 已是同一内容 → 零写入（不再产生一次空 commit）。
+			const sidecarUnchanged = !!(existingSidecarSha && cachedSidecarContent
+				&& bytesEqual(cachedSidecarContent, sidecarContent));
+			if (!sidecarUnchanged) {
+				let newSidecarSha: string;
+				if (existingSidecarSha) {
+					newSidecarSha = await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`);
+				} else {
+					newSidecarSha = await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+				}
+				this.contentCache.set(sidecarPath, sidecarContent);
+				this._persistContent(sidecarPath, sidecarContent);
+				this.shaCache.set(sidecarPath, newSidecarSha);
+				this._persistSha(sidecarPath, newSidecarSha);
 			}
-			this.contentCache.set(sidecarPath, sidecarContent);
-			this._persistContent(sidecarPath, sidecarContent);
-			this.shaCache.set(sidecarPath, newSidecarSha);
-			this._persistSha(sidecarPath, newSidecarSha);
 		} else {
 			log.warn(`writeFileWithMtime: refusing to write nested mtime sidecar for ${path} (already a .mtime sidecar)`);
 		}

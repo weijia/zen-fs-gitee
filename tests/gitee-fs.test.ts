@@ -803,6 +803,33 @@ describe('GiteeFS', () => {
 			expect(dataWritten).toBe(true);
 			expect(fs.shaCache.get('/config.json')).toBe('NEW');
 			});
+
+			it('repeated identical write of the same sidecar produces no extra requests', async () => {
+			const data = '{"key":"value"}';
+			const mtime = 1700000000123;
+
+			fetchSpy.mockResolvedValueOnce(mockTreeResponse([
+				{ path: 'config.json', type: 'blob', sha: 'S1', size: data.length, mode: '100644' },
+			]));
+			await fs.init();
+			// 远端内容已缓存，且数据文件内容与本次写入相同。
+			fs.contentCache.set('/config.json', new TextEncoder().encode(data));
+
+			const written: string[] = [];
+			fetchSpy.mockImplementation((url: string, init?: RequestInit) => {
+				if (init?.method === 'PUT' || init?.method === 'POST') written.push(String(url));
+				return Promise.resolve(mockOkJson({ content: { sha: 'SC' } }) as Response);
+			});
+
+			await fs.writeFileWithMtime('/config.json', data, mtime);
+			// 第一次：数据内容未变 → 只写 sidecar（一次 createFile）。
+			expect(written).toHaveLength(1);
+			expect(written[0]).toContain('config.json.mtime');
+
+			await fs.writeFileWithMtime('/config.json', data, mtime);
+			// 第二次：数据与 sidecar 内容都未变 → 零写入（不再产生空 commit）。
+			expect(written).toHaveLength(1);
+			});
 			});
 
 	describe('createSnapshot', () => {
