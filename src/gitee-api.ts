@@ -311,8 +311,8 @@ export class GiteeAPI {
 	// Contents API (GET / POST / PUT / DELETE — all supported by Gitee)
 	// -----------------------------------------------------------------------
 
-	async getContents(path: string): Promise<GiteeContentItem | GiteeContentItem[]> {
-		return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.currentBranch}`);
+	async getContents(path: string, branch: string = this.currentBranch): Promise<GiteeContentItem | GiteeContentItem[]> {
+		return this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${branch}`);
 	}
 
 	/**
@@ -359,6 +359,17 @@ export class GiteeAPI {
 					`Gitee 仓库 ${this.owner}/${this.repo} 无法写入：分支 '${this.currentBranch}' 不存在或仓库为空`
 					+ '（自动初始化未完成，请查看同步日志中的初始化错误）',
 				);
+			}
+			// Gitee 对 POST 创建“已存在路径”返回 400（中文措辞“文件名已存在”/
+			// “文件新建失败”）。本地 shaCache 是冷的（例如刚被 sidecar 清理删掉，
+			// 或其它设备/实例已先写过该路径）时，写 sidecar/元数据必然走 POST。
+			// 这里先取远端 sha，存在则改走 PUT 更新，避免把 400 抛给同步/激活流程。
+			if (status === 400) {
+				const existingSha = await this.getFileSha(path);
+				if (existingSha) {
+					verboseLog(`createFile: ${path} already exists remotely, retrying as PUT update`);
+					return this.updateFile(path, content, existingSha, message);
+				}
 			}
 			throw err;
 		}
@@ -412,7 +423,7 @@ export class GiteeAPI {
 	 */
 	async deleteFile(path: string, sha: string, message: string): Promise<void> {
 		try {
-			await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.branch}`, {
+			await this.request(`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?branch=${this.currentBranch}`, {
 				method: 'DELETE',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -440,7 +451,14 @@ export class GiteeAPI {
 			// Gitee 对删除“已不存在的文件”返回 400（中文措辞“文件新建失败”）。
 			// 目标文件既然已不在远端，删除即达成目的——视为成功，避免
 			// createSnapshot 清理孤儿 sidecar / 处理 tombstone 时每次都被误报为失败。
-			const stillExists = await this.getContents(path).then(() => true).catch(() => false);
+			// 复检必须与上面的 DELETE 用同一分支（currentBranch），并且直接走
+			// request（quiet404），不经任何上层内容缓存，否则并发删除/缓存滞后
+			// 会把“已不存在”误判成“仍存在”再抛出原始 400。
+			const stillExists = await this.request(
+				`/repos/${this.owner}/${this.repo}/contents/${apiPath(path)}?ref=${this.currentBranch}`,
+				undefined,
+				{ quiet404: true },
+			).then(() => true).catch(() => false);
 			if (!stillExists) return;
 			throw err;
 		}

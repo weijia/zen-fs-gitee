@@ -545,7 +545,11 @@ export class GiteeFS extends IndexFS {
 			inode.update({ mtimeMs: effectiveMtime, size: writeContent.length });
 		}
 
-		const sha = this.shaCache.get(path);
+		const baseName = path.slice(path.lastIndexOf('/') + 1);
+		const isMetaPath = isMetadataSidecarToDelete(baseName);
+		// 写 sidecar / 元数据前先预热 shaCache：冷缓存下对远端已存在的路径
+		// 必然走 POST，会被 Gitee 以 400「文件名已存在」拒绝。预热后可稳定走 PUT。
+		const sha = this.shaCache.get(path) ?? (isMetaPath ? await this.ensureSha(path) : undefined);
 		if (sha) {
 			// Content unchanged (only mtime differs) → skip re-writing the data
 			// file so we don't create a pointless commit. The sidecar below
@@ -607,14 +611,18 @@ export class GiteeFS extends IndexFS {
 		}
 
 		const sha = this.shaCache.get(path);
+		const baseName = path.slice(path.lastIndexOf('/') + 1);
+		const isMetaPath = isMetadataSidecarToDelete(baseName);
 		this._queue(
 			(async () => {
 				// Content unchanged (only mtime differs) → skip the data-file API
 				// write entirely (no pointless commit). Compare against `previous`
 				// (the cached remote content), not the freshly-merged buffer. See DESIGN.md §4.
 				if (sha && previous && bytesEqual(previous, writeContent)) return;
-				const newSha = sha
-					? await this.api.updateFile(path, writeContent, sha, `Update ${path}`)
+				// 元数据路径在冷缓存下先探测远端 sha，避免 POST 撞上已存在文件。
+				const effectiveSha = sha ?? (isMetaPath ? await this.ensureSha(path) : undefined);
+				const newSha = effectiveSha
+					? await this.api.updateFile(path, writeContent, effectiveSha, `Update ${path}`)
 					: await this.api.createFile(path, writeContent, `Create ${path}`);
 				this.shaCache.set(path, newSha);
 				this._persistSha(path, newSha);
@@ -645,7 +653,7 @@ export class GiteeFS extends IndexFS {
 		}
 		const sidecarPath = mtimePathFor(path);
 		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
-		const existingSidecarSha = this.shaCache.get(sidecarPath);
+		const existingSidecarSha = await this.ensureSha(sidecarPath);
 		const newSha = existingSidecarSha
 			? await this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
 			: await this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
@@ -678,12 +686,14 @@ export class GiteeFS extends IndexFS {
 		}
 		const sidecarPath = mtimePathFor(path);
 		const sidecarContent = new TextEncoder().encode(String(mtimeMs));
-		const existingSidecarSha = this.shaCache.get(sidecarPath);
 		this._queue(
-			(existingSidecarSha
-				? this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
-				: this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`)
-			)
+			(async () => {
+				// 冷缓存下先探测远端 sha，避免对已存在的 sidecar 走 POST 撞 400。
+				const existingSidecarSha = this.shaCache.get(sidecarPath) ?? await this.ensureSha(sidecarPath);
+				return existingSidecarSha
+					? this.api.updateFile(sidecarPath, sidecarContent, existingSidecarSha, `Update sidecar for ${path}`)
+					: this.api.createFile(sidecarPath, sidecarContent, `Create sidecar for ${path}`);
+			})()
 				.then((newSha) => {
 					this.shaCache.set(sidecarPath, newSha);
 					this._persistSha(sidecarPath, newSha);
@@ -706,6 +716,24 @@ export class GiteeFS extends IndexFS {
 	}
 
 	// --- WriteFile override (forward { mtime } into the sidecar) ---
+
+	/**
+	 * 预热 shaCache：写入 sidecar / 元数据前，如果本地没有该路径的 blob SHA，
+	 * 先向远端探测一次。冷缓存（例如刚被 sidecar 清理删掉、进程重启、或其它
+	 * 设备先写过该路径）下直接 POST 会被 Gitee 以 400「文件名已存在」拒绝；
+	 * 预热后可稳定走 PUT，不把一次无谓失败升级为后端错误状态。
+	 */
+	private async ensureSha(path: string): Promise<string | undefined> {
+		const cached = this.shaCache.get(path);
+		if (cached) return cached;
+		const sha = await this.api.getFileSha(path).catch(() => null);
+		if (sha) {
+			this.shaCache.set(path, sha);
+			this._persistSha(path, sha);
+			return sha;
+		}
+		return undefined;
+	}
 
 	/**
 	 * Override base `writeFile` so an optional `{ mtime }` option is forwarded

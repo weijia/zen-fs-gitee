@@ -282,8 +282,8 @@ describe('GiteeFS', () => {
 			expect(fs.contentCache.get('/sync.txt')!).toEqual(data);
 			// Wait for background queue to drain
 			await fs.sync();
-			// 1 (tree) + 1 (data write) + 1 (mtime sidecar write) = 3
-			expect(fetchSpy).toHaveBeenCalledTimes(3);
+			// 1 (tree) + 1 (sidecar sha probe) + 1 (data write) + 1 (mtime sidecar write) = 4
+			expect(fetchSpy).toHaveBeenCalledTimes(4);
 		});
 
 		it('skips data-file write when content is unchanged (only mtime differs)', async () => {
